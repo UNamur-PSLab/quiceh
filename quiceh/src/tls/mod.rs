@@ -428,7 +428,7 @@ impl Handshake {
 
     pub fn set_quic_method(&mut self) -> Result<()> {
         map_result(unsafe {
-            SSL_set_quic_method(self.as_mut_ptr(), &QUICHE_STREAM_METHOD)
+            SSL_set_quic_method(self.as_mut_ptr(), &QUICEH_STREAM_METHOD)
         })
     }
 
@@ -702,6 +702,15 @@ pub struct ExData<'a> {
     pub trace_id: &'a str,
 
     pub is_server: bool,
+
+    /// Whether the local endpoint wants to use OCB3 (advertised via the
+    /// `use_ocb3` transport parameter).
+    pub local_ocb3: bool,
+
+    /// Whether this connection is resuming a session whose effective AEAD
+    /// was OCB3. Only meaningful for 0-RTT key derivation, where the peer's
+    /// transport parameters for this session are not available yet.
+    pub resumed_ocb3: bool,
 }
 
 fn get_ex_data_from_ptr<'a, T>(ptr: *const SSL, idx: c_int) -> Option<&'a mut T> {
@@ -724,6 +733,55 @@ fn get_cipher_from_ptr(cipher: *const SSL_CIPHER) -> Result<crypto::Algorithm> {
     Ok(alg)
 }
 
+/// Whether the peer's transport parameters (as exposed by the TLS library
+/// for the current handshake) include the `use_ocb3` flag.
+fn peer_wants_ocb3(ssl: *mut SSL, is_server: bool) -> bool {
+    let mut ptr: *const u8 = ptr::null();
+    let mut len: usize = 0;
+
+    unsafe {
+        SSL_get_peer_quic_transport_params(ssl, &mut ptr, &mut len)
+    };
+
+    if len == 0 {
+        return false;
+    }
+
+    let raw = unsafe { slice::from_raw_parts(ptr, len) };
+
+    match super::TransportParams::decode(raw, is_server) {
+        Ok(tp) => tp.use_ocb3,
+        Err(_) => false,
+    }
+}
+
+/// Whether OCB3 must be used to protect the keys of the given level.
+///
+/// Initial and Handshake epochs always keep the negotiated AEAD. For 1-RTT,
+/// both endpoints compute the same conjunction (local intent and peer
+/// intent), so they can never disagree. 0-RTT keys are derived before the
+/// peer's transport parameters for this session are known, so they rely on
+/// session state instead: the client uses the effective decision stored in
+/// the session buffer, the server uses the client's parameters embedded in
+/// the ticket.
+fn use_ocb3(ssl: *mut SSL, ex_data: &ExData, level: crypto::Level) -> bool {
+    match level {
+        crypto::Level::Initial | crypto::Level::Handshake => false,
+
+        crypto::Level::ZeroRTT => {
+            if ex_data.is_server {
+                ex_data.local_ocb3 && peer_wants_ocb3(ssl, ex_data.is_server)
+            } else {
+                ex_data.local_ocb3 && ex_data.resumed_ocb3
+            }
+        },
+
+        crypto::Level::OneRTT => {
+            ex_data.local_ocb3 && peer_wants_ocb3(ssl, ex_data.is_server)
+        },
+    }
+}
+
 extern "C" fn set_read_secret(
     ssl: *mut SSL, level: crypto::Level, cipher: *const SSL_CIPHER,
     secret: *const u8, secret_len: usize,
@@ -737,6 +795,8 @@ extern "C" fn set_read_secret(
 
     trace!("{} set read secret lvl={:?}", ex_data.trace_id, level);
 
+    let ocb3 = use_ocb3(ssl, ex_data, level);
+
     let space = match level {
         crypto::Level::Initial =>
             &mut ex_data.pkt_num_spaces[packet::Epoch::Initial],
@@ -749,7 +809,24 @@ extern "C" fn set_read_secret(
     };
 
     let aead = match get_cipher_from_ptr(cipher) {
-        Ok(v) => v,
+        Ok(v) => {
+            // OCB3 rides on the block cipher of the negotiated AEAD. Without
+            // a block cipher underneath (ChaCha20) the negotiated AEAD is
+            // kept, and the handshake fails once it completes.
+            if ocb3 {
+                match v {
+                    crypto::Algorithm::AES128_GCM => {
+                        crypto::Algorithm::OCB3_AES128
+                    }
+                    crypto::Algorithm::AES256_GCM => {
+                        crypto::Algorithm::OCB3_AES256
+                    }
+                    _ => v,
+                }
+            } else {
+                v
+            }
+        },
 
         Err(_) => return 0,
     };
@@ -788,6 +865,8 @@ extern "C" fn set_write_secret(
 
     trace!("{} set write secret lvl={:?}", ex_data.trace_id, level);
 
+    let ocb3 = use_ocb3(ssl, ex_data, level);
+
     let space = match level {
         crypto::Level::Initial =>
             &mut ex_data.pkt_num_spaces[packet::Epoch::Initial],
@@ -800,7 +879,24 @@ extern "C" fn set_write_secret(
     };
 
     let aead = match get_cipher_from_ptr(cipher) {
-        Ok(v) => v,
+        Ok(v) => {
+            // OCB3 rides on the block cipher of the negotiated AEAD. Without
+            // a block cipher underneath (ChaCha20) the negotiated AEAD is
+            // kept, and the handshake fails once it completes.
+            if ocb3 {
+                match v {
+                    crypto::Algorithm::AES128_GCM => {
+                        crypto::Algorithm::OCB3_AES128
+                    }
+                    crypto::Algorithm::AES256_GCM => {
+                        crypto::Algorithm::OCB3_AES256
+                    }
+                    _ => v,
+                }
+            } else {
+                v
+            }
+        },
 
         Err(_) => return 0,
     };
@@ -989,7 +1085,7 @@ extern "C" fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
     };
 
     let mut buffer =
-        Vec::with_capacity(8 + peer_params.len() + 8 + session_bytes.len());
+        Vec::with_capacity(8 + peer_params.len() + 8 + session_bytes.len() + 1);
 
     let session_bytes_len = session_bytes.len() as u64;
 
@@ -1011,6 +1107,25 @@ extern "C" fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
     }
 
     if buffer.write(peer_params).is_err() {
+        std::mem::forget(handshake);
+        return 0;
+    }
+
+    // Record the effective OCB3 decision for this session. On resumption the
+    // 0-RTT keys must be protected with the same AEAD as the original
+    // session, and the connection must fail if an OCB3 session can no longer
+    // be honored.
+    let peer_wants_ocb3 = match super::TransportParams::decode(
+        peer_params,
+        ex_data.is_server,
+    ) {
+        Ok(tp) => tp.use_ocb3,
+        Err(_) => false,
+    };
+
+    let effective_ocb3 = (ex_data.local_ocb3 && peer_wants_ocb3) as u8;
+
+    if buffer.write(&[effective_ocb3]).is_err() {
         std::mem::forget(handshake);
         return 0;
     }

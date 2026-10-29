@@ -70,6 +70,17 @@ pub enum Algorithm {
 
     #[allow(non_camel_case_types)]
     ChaCha20_Poly1305,
+
+    /// OCB3 using AES-128. Experimental, for testing only: used as a
+    /// drop-in replacement for the negotiated AEAD for post-handshake
+    /// (and 0-RTT) packet protection when both peers agreed on it via
+    /// transport parameters.
+    #[allow(non_camel_case_types)]
+    OCB3_AES128,
+
+    /// OCB3 using AES-256. See [`Algorithm::OCB3_AES128`].
+    #[allow(non_camel_case_types)]
+    OCB3_AES256,
 }
 
 impl Algorithm {
@@ -77,16 +88,20 @@ impl Algorithm {
     // submodule (openssl-quictls / boringssl).
     fn get_evp_digest(self) -> *const EVP_MD {
         match self {
-            Algorithm::AES128_GCM => unsafe { EVP_sha256() },
-            Algorithm::AES256_GCM => unsafe { EVP_sha384() },
+            Algorithm::AES128_GCM | Algorithm::OCB3_AES128 => {
+                unsafe { EVP_sha256() }
+            },
+            Algorithm::AES256_GCM | Algorithm::OCB3_AES256 => {
+                unsafe { EVP_sha384() }
+            },
             Algorithm::ChaCha20_Poly1305 => unsafe { EVP_sha256() },
         }
     }
 
     pub const fn key_len(self) -> usize {
         match self {
-            Algorithm::AES128_GCM => 16,
-            Algorithm::AES256_GCM => 32,
+            Algorithm::AES128_GCM | Algorithm::OCB3_AES128 => 16,
+            Algorithm::AES256_GCM | Algorithm::OCB3_AES256 => 32,
             Algorithm::ChaCha20_Poly1305 => 32,
         }
     }
@@ -97,17 +112,21 @@ impl Algorithm {
         }
 
         match self {
-            Algorithm::AES128_GCM => 16,
-            Algorithm::AES256_GCM => 16,
-            Algorithm::ChaCha20_Poly1305 => 16,
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::ChaCha20_Poly1305
+            | Algorithm::OCB3_AES128
+            | Algorithm::OCB3_AES256 => 16,
         }
     }
 
     pub const fn nonce_len(self) -> usize {
         match self {
-            Algorithm::AES128_GCM => 12,
-            Algorithm::AES256_GCM => 12,
-            Algorithm::ChaCha20_Poly1305 => 12,
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::ChaCha20_Poly1305
+            | Algorithm::OCB3_AES128
+            | Algorithm::OCB3_AES256 => 12,
         }
     }
 }

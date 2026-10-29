@@ -33,6 +33,9 @@ impl Algorithm {
             Algorithm::ChaCha20_Poly1305 => unsafe {
                 EVP_aead_chacha20_poly1305()
             },
+            Algorithm::OCB3_AES128 | Algorithm::OCB3_AES256 => {
+                unreachable!("OCB3 has no EVP AEAD")
+            },
         }
     }
 }
@@ -73,6 +76,11 @@ impl PacketKey {
     pub fn new(
         alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, _enc: u32,
     ) -> Result<Self> {
+        if matches!(alg, Algorithm::OCB3_AES128 | Algorithm::OCB3_AES256) {
+            log::error!("OCB3 AEAD is not implemented for boring or aws");
+            return Err(Error::CryptoFail);
+        }
+
         Ok(Self {
             alg,
             ctx: make_aead_ctx(alg, &key)?,
@@ -264,7 +272,9 @@ pub(crate) enum HeaderProtectionKey {
 impl HeaderProtectionKey {
     pub fn new(alg: Algorithm, hp_key: Vec<u8>) -> Result<Self> {
         match alg {
-            Algorithm::AES128_GCM | Algorithm::AES256_GCM => unsafe {
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::OCB3_AES128 => unsafe {
                 let key_len_bits = alg.key_len() as u32 * 8;
 
                 let mut aes_key = MaybeUninit::<AES_KEY>::uninit();
@@ -281,6 +291,11 @@ impl HeaderProtectionKey {
 
                 let aes_key = aes_key.assume_init();
                 Ok(Self::Aes(aes_key))
+            },
+
+            Algorithm::OCB3_AES256 => {
+                log::error!("AES256 is not supported for our OCB3 provider");
+                Err(Error::CryptoFail)
             },
 
             Algorithm::ChaCha20_Poly1305 => Ok(Self::ChaCha(hp_key)),
