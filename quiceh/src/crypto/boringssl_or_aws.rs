@@ -3,6 +3,9 @@ use super::*;
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 
+#[cfg(feature = "ocb3")]
+use ocb3::{AEctx, DecryptIO};
+
 use libc::c_int;
 use libc::c_uint;
 use libc::c_void;
@@ -66,8 +69,11 @@ fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
 
 pub(crate) struct PacketKey {
     alg: Algorithm,
+    
+    ctx: Option<EVP_AEAD_CTX>,
 
-    ctx: EVP_AEAD_CTX,
+    #[cfg(feature = "ocb3")]
+    ocb3_ctx: Option<AEctx>,
 
     nonce: Vec<u8>,
 }
@@ -76,16 +82,32 @@ impl PacketKey {
     pub fn new(
         alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, _enc: u32,
     ) -> Result<Self> {
+        #[cfg(not(feature = "ocb3"))]
         if matches!(alg, Algorithm::OCB3_AES128 | Algorithm::OCB3_AES256) {
-            log::error!("OCB3 AEAD is not implemented for boring or aws");
+            log::error!("OCB3 feature is not enabled!");
             return Err(Error::CryptoFail);
         }
-
-        Ok(Self {
-            alg,
-            ctx: make_aead_ctx(alg, &key)?,
-            nonce: iv,
-        })
+        match alg {
+            Algorithm::AES128_GCM | Algorithm::AES256_GCM | Algorithm::ChaCha20_Poly1305 => {
+                Ok(Self {
+                    alg,
+                    ctx: Some(make_aead_ctx(alg, &key)?),
+                    #[cfg(feature = "ocb3")]
+                    ocb3_ctx: None,
+                    nonce: iv,
+                })
+            },
+            #[cfg(feature = "ocb3")]
+            Algorithm::OCB3_AES128 => {
+                Ok(Self {
+                    alg,
+                    ctx: None,
+                    ocb3_ctx: Some(AEctx::new(&key)),
+                    nonce: iv,
+                })
+            },
+            _ => unimplemented!()
+        }
     }
 
     pub fn from_secret(aead: Algorithm, secret: &[u8], enc: u32) -> Result<Self> {
@@ -117,26 +139,45 @@ impl PacketKey {
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let rc = unsafe {
-            EVP_AEAD_CTX_open(
-                &self.ctx,          // ctx
-                buf.as_mut_ptr(),   // out
-                &mut out_len,       // out_len
-                max_out_len,        // max_out_len
-                nonce[..].as_ptr(), // nonce
-                nonce.len(),        // nonce_len
-                buf.as_ptr(),       // inp
-                buf.len(),          // in_len
-                ad.as_ptr(),        // ad
-                ad.len(),           // ad_len
-            )
-        };
+        match self.alg {
+            Algorithm::AES128_GCM | Algorithm::AES256_GCM | Algorithm::ChaCha20_Poly1305 => {
+                let rc = unsafe {
+                    EVP_AEAD_CTX_open(
+                        self.ctx.as_ref().unwrap(), // ctx
+                        buf.as_mut_ptr(),   // out
+                        &mut out_len,       // out_len
+                        max_out_len,        // max_out_len
+                        nonce[..].as_ptr(), // nonce
+                        nonce.len(),        // nonce_len
+                        buf.as_ptr(),       // inp
+                        buf.len(),          // in_len
+                        ad.as_ptr(),        // ad
+                        ad.len(),           // ad_len
+                    )
+                };
 
-        if rc != 1 {
-            return Err(Error::CryptoFail);
+                if rc != 1 {
+                    return Err(Error::CryptoFail);
+                }
+                Ok(out_len)
+            },
+            #[cfg(feature = "ocb3")]
+            Algorithm::OCB3_AES128 => {
+                match self.ocb3_ctx.unwrap_or_else(|| return
+                    Err(Error::CryptoFail)).ae_decrypt(DecryptIO::InPlace(buf), &nonce, ad) {
+                    Ok(()) => Ok(out_len),
+                    Err(e) => { 
+                        log::error!("decryption failed with error {:?}", e);
+                        Err(Error::CryptoFail)
+                    },
+                }
+            },
+            _ => {
+                log::error!("Unsupported algorithm {:?}", self.alg);
+                Err(Error::CryptoFail)
+            }
         }
 
-        Ok(out_len)
     }
 
     pub fn open_with_u64_counter_into(
@@ -159,26 +200,49 @@ impl PacketKey {
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let rc = unsafe {
-            EVP_AEAD_CTX_open(
-                &self.ctx,          // ctx
-                into.as_mut_ptr(),  // out
-                &mut out_len,       // out_len
-                max_out_len,        // max_out_len
-                nonce[..].as_ptr(), // nonce
-                nonce.len(),        // nonce_len
-                buf.as_ptr(),       // inp
-                buf.len(),          // in_len
-                ad.as_ptr(),        // ad
-                ad.len(),           // ad_len
-            )
-        };
+        match self.alg {
+            Algorithm::AES128_GCM | Algorithm::AES256_GCM | Algorithm::ChaCha20_Poly1305 => {
+                let rc = unsafe {
+                    EVP_AEAD_CTX_open(
+                        self.ctx.as_ref().unwrap(), // ctx
+                        into.as_mut_ptr(),  // out
+                        &mut out_len,       // out_len
+                        max_out_len,        // max_out_len
+                        nonce[..].as_ptr(), // nonce
+                        nonce.len(),        // nonce_len
+                        buf.as_ptr(),       // inp
+                        buf.len(),          // in_len
+                        ad.as_ptr(),        // ad
+                        ad.len(),           // ad_len
+                    )
+                };
 
-        if rc != 1 {
-            return Err(Error::CryptoFail);
+                if rc != 1 {
+                    return Err(Error::CryptoFail);
+                }
+
+                Ok(out_len)
+            },
+            #[cfg(feature = "ocb3")]
+            Algorithm::OCB3_AES128 => {
+                match self.ocb3_ctx.unwrap_or_else(|| return Err(Error::CryptoFail)).ae_decrypt(
+                    DecryptIO::OutOfPlace { in_ct: buf, out_pt: into },
+                    &nonce,
+                    ad
+                ) {
+                    Ok(()) => Ok(out_len),
+                    Err(e) => { 
+                        log::error!("decryption failed with error {:?}", e);
+                        Err(Error::CryptoFail)
+                    },
+                }
+
+            },
+            _ => {
+                log::error!("Unsupported algorithm {:?}", self.alg);
+                Err(Error::CryptoFail)
+            }
         }
-
-        Ok(out_len)
     }
 
     pub fn seal_with_u64_counter(
@@ -234,30 +298,42 @@ impl PacketKey {
             buf.as_ptr()
         };
 
-        let rc = unsafe {
-            let out_tag_mut_ptr = buf.as_mut_ptr().add(in_len);
-            EVP_AEAD_CTX_seal_scatter(
-                &self.ctx,              // ctx
-                buf.as_mut_ptr(),       // out
-                out_tag_mut_ptr,        // out_tag
-                &mut out_tag_len,       // out_tag_len
-                tag_len + extra_in_len, // max_out_tag_len
-                nonce[..].as_ptr(),     // nonce
-                nonce.len(),            // nonce_len
-                in_ptr,                 // inp
-                in_len,                 // in_len
-                extra_in_ptr,           // extra_in
-                extra_in_len,           // extra_in_len
-                ad.as_ptr(),            // ad
-                ad.len(),               // ad_len
-            )
-        };
-        if rc != 1 {
-            debug!("seal_scatter returned -1");
-            return Err(Error::CryptoFail);
-        }
+        match self.alg {
+            Algorithm::AES128_GCM | Algorithm::AES256_GCM | Algorithm::ChaCha20_Poly1305 => {
+                let rc = unsafe {
+                    let out_tag_mut_ptr = buf.as_mut_ptr().add(in_len);
+                    EVP_AEAD_CTX_seal_scatter(
+                        self.ctx.as_ref().unwrap(),              // ctx
+                        buf.as_mut_ptr(),       // out
+                        out_tag_mut_ptr,        // out_tag
+                        &mut out_tag_len,       // out_tag_len
+                        tag_len + extra_in_len, // max_out_tag_len
+                        nonce[..].as_ptr(),     // nonce
+                        nonce.len(),            // nonce_len
+                        in_ptr,                 // inp
+                        in_len,                 // in_len
+                        extra_in_ptr,           // extra_in
+                        extra_in_len,           // extra_in_len
+                        ad.as_ptr(),            // ad
+                        ad.len(),               // ad_len
+                    )
+                };
+                if rc != 1 {
+                    debug!("seal_scatter returned -1");
+                    return Err(Error::CryptoFail);
+                }
 
-        Ok(in_len + out_tag_len)
+                Ok(in_len + out_tag_len)
+            },
+            #[cfg(feature = "ocb3")]
+            Algorithm::OCB3_AES128 => {
+                Ok(in_len + out_tag_len)
+            },
+            _ => {
+                log::error!("Unsupported algorithm {:?}", self.alg);
+                Err(Error::CryptoFail)
+            }
+        }
     }
 }
 

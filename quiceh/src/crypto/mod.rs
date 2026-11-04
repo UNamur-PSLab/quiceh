@@ -722,5 +722,13 @@ mod tests {
     }
 }
 
+#[cfg(not(feature = "ocb3"))]
 mod boringssl_or_aws;
+#[cfg(not(feature = "ocb3"))]
 pub(crate) use boringssl_or_aws::*;
+#[cfg(feature = "ocb3")]
+mod ocb3;
+#[cfg(feature = "ocb3")]
+pub(crate) use ocb3::*;
+#[cfg(feature = "ocb3")]
+pub(crate) use boringssl_or_aws::{hkdf_expand, hkdf_extract};
