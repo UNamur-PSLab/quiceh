@@ -10109,7 +10109,7 @@ impl TransportParams {
                     tp.initial_source_connection_id = Some(val.to_vec().into());
                 },
 
-                0x00010 => {
+                0x0010 => {
                     if is_server {
                         return Err(Error::InvalidTransportParam);
                     }
@@ -10117,12 +10117,12 @@ impl TransportParams {
                     tp.retry_source_connection_id = Some(val.to_vec().into());
                 },
 
-                0x0011 => {
-                    tp.use_ocb3 = true;
-                },
-
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+                
+                0xff71=> {
+                    tp.use_ocb3 = true;
                 },
 
                 // Ignore unknown parameters.
@@ -10278,10 +10278,6 @@ impl TransportParams {
             }
         }
 
-        if tp.use_ocb3 {
-            TransportParams::encode_param(&mut b, 0x0011, 0)?;
-        }
-
         if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
             TransportParams::encode_param(
                 &mut b,
@@ -10289,6 +10285,10 @@ impl TransportParams {
                 octets_rev::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+        
+        if tp.use_ocb3 {
+            TransportParams::encode_param(&mut b, 0xff71, 0)?;
         }
 
         let out_len = b.off();
@@ -11183,7 +11183,7 @@ mod tests {
         let mut raw_params = [42; 256];
         let raw_params =
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
-        assert_eq!(raw_params.len(), 96);
+        assert_eq!(raw_params.len(), 99);
 
         let new_tp = TransportParams::decode(raw_params, false).unwrap();
 
@@ -11273,7 +11273,8 @@ mod tests {
 
         let encoded =
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
-        assert!(encoded.ends_with(&[0x11, 0x00]));
+        println!("{:?}", encoded);
+        assert!(encoded.ends_with(&[0xff, 0x71, 0x00]));
 
         let new_tp = TransportParams::decode(encoded, false).unwrap();
         assert!(new_tp.use_ocb3);
