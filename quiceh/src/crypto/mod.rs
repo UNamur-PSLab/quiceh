@@ -242,6 +242,32 @@ impl Open {
     }
 }
 
+/// One plaintext piece of a packet being sealed, described relative to the
+/// destination buffer.
+///
+/// A packet payload is not always contiguous in the sender's buffers: with the
+/// hidden copy zero-copy path the stream frames are encrypted straight from
+/// the application's buffer while the control frames are written in place
+/// inside the packet itself. Describing each piece as either in place or out
+/// of place keeps the destination a single `&mut [u8]` covering the whole
+/// payload, instead of a slice truncated where the pieces meet.
+pub(crate) enum SealPiece<'a> {
+    /// Already at its final offset inside the destination buffer.
+    InPlace { len: usize },
+
+    /// Read from outside the destination buffer.
+    OutOfPlace(&'a [u8]),
+}
+
+impl SealPiece<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            SealPiece::InPlace { len } => *len,
+            SealPiece::OutOfPlace(v) => v.len(),
+        }
+    }
+}
+
 pub struct Seal {
     alg: Algorithm,
 
@@ -313,45 +339,33 @@ impl Seal {
         })
     }
 
+    /// Encrypts `head` followed by `tail` as a single payload, writing the
+    /// ciphertext and the tag at the start of `buf`.
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        in_buf: Option<&[u8]>, extra_in: Option<&[u8]>, scatter_crypt: bool,
+        &self, counter: u64, ad: &[u8], buf: &mut [u8], head: SealPiece,
+        tail: SealPiece,
     ) -> Result<usize> {
         if cfg!(feature = "fuzzing") {
-            let tag_len = if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_V1
-            {
-                self.alg.tag_len()
-            } else {
-                let extra_in_len = match extra_in {
-                    Some(v) => v.len(),
-                    None => 0,
-                };
-                self.alg.tag_len() + extra_in_len
-            };
+            let head_len = head.len();
+            let tag_len = self.alg.tag_len();
+            let out_len = head_len + tail.len() + tag_len;
 
-            if let Some(extra) = extra_in {
-                if in_len + tag_len > buf.len() {
-                    return Err(Error::CryptoFail);
-                }
-                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
-                return Ok(in_len + extra.len());
-            }
-            if !scatter_crypt && in_len + tag_len > buf.len() {
+            if out_len > buf.len() {
                 return Err(Error::CryptoFail);
             }
 
-            return Ok(in_len + tag_len);
+            if let SealPiece::OutOfPlace(v) = head {
+                buf[..head_len].copy_from_slice(v);
+            }
+
+            if let SealPiece::OutOfPlace(v) = tail {
+                buf[head_len..out_len - tag_len].copy_from_slice(v);
+            }
+
+            return Ok(out_len);
         }
 
-        self.packet.seal_with_u64_counter(
-            counter,
-            ad,
-            buf,
-            in_len,
-            in_buf,
-            extra_in,
-            scatter_crypt,
-        )
+        self.packet.seal_with_u64_counter(counter, ad, buf, head, tail)
     }
 }
 

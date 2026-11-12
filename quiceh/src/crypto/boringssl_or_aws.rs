@@ -242,74 +242,75 @@ impl PacketKey {
     }
 
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        in_buf: Option<&[u8]>, extra_in: Option<&[u8]>, scatter_crypt: bool,
+        &self, counter: u64, ad: &[u8], buf: &mut [u8], head: SealPiece,
+        tail: SealPiece,
     ) -> Result<usize> {
-        if cfg!(feature = "fuzzing") {
-            if let Some(extra) = extra_in {
-                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
-                return Ok(in_len + extra.len());
-            }
-
-            return Ok(in_len);
-        }
-
+        let head_len = head.len();
+        let tail_len = tail.len();
         let tag_len = self.alg.tag_len();
 
-        // So: if we use hidden_copy
-        //
-        // buf is the desitination buffer whose length
-        // ends at the payload offset.
-        //
-        // If REVERSO:
-        //  in_buf is the stream_frame of in_buf.len() bytes
-        //  extra_in is pointing to buf at payload_offset+stream_len.
-        //  remaining length should hold extra_in_len + tag_len
-        //
-        // if V1:
-        //  in_buf is the ctrl data which is contained inside buf at position
-        // payload_offset  this is expected to be written in buf at the
-        // same position.  the length of in_buf should be able to hold
-        // ctrl_len, stream_len and tag_len  extra_in contains the
-        // stream_frame of stream_len bytes.
-        //
-        let (extra_in_ptr, extra_in_len) = match extra_in {
-            Some(v) => (v.as_ptr(), v.len()),
-            None => (std::ptr::null(), 0),
-        };
+        if cfg!(feature = "fuzzing") {
+            if let SealPiece::OutOfPlace(v) = head {
+                buf[..head_len].copy_from_slice(v);
+            }
 
-        let mut out_tag_len = tag_len + extra_in_len;
+            if let SealPiece::OutOfPlace(v) = tail {
+                buf[head_len..head_len + tail_len].copy_from_slice(v);
+            }
 
-        // Make sure it fits in the buffer.
-        if !scatter_crypt && in_len + tag_len > buf.len() {
+            return Ok(head_len + tail_len);
+        }
+
+        // The destination covers the whole payload followed by the tag,
+        // whichever AEAD ends up writing it.
+        if head_len + tail_len + tag_len > buf.len() {
             debug!("Buffer too small");
             return Err(Error::CryptoFail);
         }
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let in_ptr = if let Some(in_buf) = in_buf {
-            in_buf.as_ptr()
-        } else {
-            buf.as_ptr()
-        };
-
         match self.alg {
             Algorithm::AES128_GCM | Algorithm::AES256_GCM | Algorithm::ChaCha20_Poly1305 => {
+                let mut out_tag_len = tag_len + tail_len;
+
+                // EVP_AEAD_CTX_seal_scatter encrypts inp into out and
+                // extra_in into out_tag, so an in-place piece is simply
+                // read back from the destination at its own offset.
+                let (in_ptr, extra_in_ptr) = unsafe {
+                    let dst = buf.as_mut_ptr();
+
+                    let in_ptr = match head {
+                        SealPiece::OutOfPlace(v) => v.as_ptr(),
+                        SealPiece::InPlace { .. } => dst,
+                    };
+
+                    let extra_in_ptr = if tail_len == 0 {
+                        std::ptr::null()
+                    } else {
+                        match tail {
+                            SealPiece::OutOfPlace(v) => v.as_ptr(),
+                            SealPiece::InPlace { .. } => dst.add(head_len),
+                        }
+                    };
+
+                    (in_ptr, extra_in_ptr)
+                };
+
                 let rc = unsafe {
-                    let out_tag_mut_ptr = buf.as_mut_ptr().add(in_len);
+                    let out_tag_mut_ptr = buf.as_mut_ptr().add(head_len);
                     EVP_AEAD_CTX_seal_scatter(
                         self.ctx.as_ref().unwrap(),              // ctx
                         buf.as_mut_ptr(),       // out
                         out_tag_mut_ptr,        // out_tag
                         &mut out_tag_len,       // out_tag_len
-                        tag_len + extra_in_len, // max_out_tag_len
+                        tag_len + tail_len,     // max_out_tag_len
                         nonce[..].as_ptr(),     // nonce
                         nonce.len(),            // nonce_len
                         in_ptr,                 // inp
-                        in_len,                 // in_len
+                        head_len,               // in_len
                         extra_in_ptr,           // extra_in
-                        extra_in_len,           // extra_in_len
+                        tail_len,               // extra_in_len
                         ad.as_ptr(),            // ad
                         ad.len(),               // ad_len
                     )
@@ -319,35 +320,88 @@ impl PacketKey {
                     return Err(Error::CryptoFail);
                 }
 
-                Ok(in_len + out_tag_len)
+                Ok(head_len + out_tag_len)
             },
             #[cfg(feature = "ocb3")]
             Algorithm::OCB3_AES128 => {
-                if scatter_crypt {
-                    // Safety: scatter_crypt implies in_buf and extra_in are Some(&[u8])
-                    match &self.ocb3_ctx {
-                        Some(ctx) => {
-                            ctx.ae_encrypt(
-                                EncryptIO::OutOfPlace { in_pt: PlainText::Scattered(in_buf.unwrap(), extra_in.unwrap()), out: buf },
-                                &nonce,
-                                ad,
-                            ).map_err(|_| Error::CryptoFail)?;
-                        },
-                        None => return Err(Error::CryptoFail),
+                // ocb3 sizes the plaintext from the slices it is handed and
+                // bounds the destination against `out.len()`, so it is given
+                // exactly the payload followed by the tag slot.
+                let payload = &mut buf[..head_len + tail_len + tag_len];
+
+                let ctx = match &self.ocb3_ctx {
+                    Some(ctx) => ctx,
+                    None => return Err(Error::CryptoFail),
+                };
+
+                let head_src = match &head {
+                    SealPiece::OutOfPlace(v) if !v.is_empty() => Some(*v),
+                    _ => None,
+                };
+
+                let tail_src = match &tail {
+                    SealPiece::OutOfPlace(v) if !v.is_empty() => Some(*v),
+                    _ => None,
+                };
+
+                // A piece that is not read from outside still contributes to
+                // the plaintext when it is non-empty, in which case it
+                // overlaps the destination.
+                let head_pinned = head_src.is_none() && head_len > 0;
+                let tail_pinned = tail_src.is_none() && tail_len > 0;
+
+                let result = if head_pinned || tail_pinned {
+                    if head_src.is_some() || tail_src.is_some() {
+                        // One piece sits inside the destination while the
+                        // other sits outside it. ocb3 takes the plaintext
+                        // pieces as shared slices and the destination as a
+                        // mutable one, so the overlap has no safe spelling;
+                        // supporting it needs an ocb3 API that reads a head
+                        // from outside while encrypting the rest in place.
+                        log::error!(
+                            "ocb3 cannot seal {} in-place bytes next to {} bytes read from outside the destination",
+                            if head_pinned { head_len } else { tail_len },
+                            if head_pinned { tail_len } else { head_len },
+                        );
+
+                        return Err(Error::CryptoFail);
                     }
+
+                    ctx.ae_encrypt(EncryptIO::InPlace(payload), &nonce, ad)
+                } else if let (Some(h), Some(t)) = (head_src, tail_src) {
+                    ctx.ae_encrypt(
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Scattered(h, t),
+                            out: payload,
+                        },
+                        &nonce,
+                        ad,
+                    )
+                } else if let Some(h) = head_src {
+                    ctx.ae_encrypt(
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Contiguous(h),
+                            out: payload,
+                        },
+                        &nonce,
+                        ad,
+                    )
+                } else if let Some(t) = tail_src {
+                    ctx.ae_encrypt(
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Contiguous(t),
+                            out: payload,
+                        },
+                        &nonce,
+                        ad,
+                    )
                 } else {
-                    match &self.ocb3_ctx {
-                        Some(ctx) => {
-                            ctx.ae_encrypt(
-                                EncryptIO::InPlace(buf),
-                                &nonce,
-                                ad,
-                            ).map_err(|_| Error::CryptoFail)?;
-                        },
-                        None => return Err(Error::CryptoFail),
-                    }
-                }
-                Ok(in_len + out_tag_len)
+                    ctx.ae_encrypt(EncryptIO::InPlace(payload), &nonce, ad)
+                };
+
+                result.map_err(|_| Error::CryptoFail)?;
+
+                Ok(head_len + tail_len + tag_len)
             },
             _ => {
                 log::error!("Unsupported algorithm {:?}", self.alg);

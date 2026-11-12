@@ -5578,7 +5578,12 @@ impl<F: BufFactory> Connection<F> {
         // The data will be send without copy; ctrl information are written
         // inside this buffer with the goal to encrypt them next to the zero-copy
         // encryted data, in out.
-        let (mut b_start, ctrl, b_len, b_ctrl_len) = if self
+        // The payload pieces are described to the AEAD relative to `b_start`,
+        // which therefore keeps covering the whole packet: `b_len` bytes of
+        // stream frames come from the rangebuf when there is one, and the
+        // `b_ctrl_len` bytes of control frames are already in place inside the
+        // destination.
+        let (mut b_start, b_len, b_ctrl_len) = if self
             .use_hidden_crypt_copy_for_zc
         {
             // If we're in VReverso, the frame should be first.
@@ -5595,22 +5600,25 @@ impl<F: BufFactory> Connection<F> {
                 trace!("frames {:?}", frames);
                 // ctrl cleartext is written inside the destination buffer,
                 // aligned on a multiple of the AES blocksize.
+                let ctrl_len = cumul - stream_len;
 
-                let (b, mut b_ctrl) = b.split_at(payload_offset + stream_len)?;
-                trace!(
-                    "split_at: {}; skipping {} bytes",
-                    payload_offset + stream_len,
-                    cumul - stream_len
-                );
-                b_ctrl.skip(cumul - stream_len)?;
-                let mut b_ctrl_rev = OctetsMutRev::from(b_ctrl);
-                push_frames_to_pkt!(b_ctrl_rev, frames, true, self.version, true);
-                b_ctrl = OctetsMut::from(b_ctrl_rev);
-                trace!("b_ctrl off at {}", b_ctrl.off());
-                (b, Some(b_ctrl), stream_len, cumul - stream_len)
+                {
+                    let (_, mut b_ctrl) =
+                        b.split_at(payload_offset + stream_len)?;
+                    trace!(
+                        "split_at: {}; skipping {} bytes",
+                        payload_offset + stream_len,
+                        ctrl_len
+                    );
+                    b_ctrl.skip(ctrl_len)?;
+                    let mut b_ctrl_rev = OctetsMutRev::from(b_ctrl);
+                    push_frames_to_pkt!(b_ctrl_rev, frames, true, self.version, true);
+                    trace!("b_ctrl off at {}", b_ctrl_rev.off());
+                }
+
+                (b, stream_len, ctrl_len)
             } else {
                 // In V1 we would start with the ctrl.
-                let (b, mut b_ctrl) = b.split_at(payload_offset)?;
                 // The StreamHeader frame should be last.
                 let stream_len = if let Some(frame) = &maybe_stream_header {
                     let frame_len = frame.wire_len();
@@ -5635,10 +5643,15 @@ impl<F: BufFactory> Connection<F> {
                     0_usize
                 };
 
-                push_frames_to_pkt!(b_ctrl, frames, true, self.version, false);
-                let b_ctrl_len = b_ctrl.off();
-                b_ctrl.rewind(b_ctrl_len)?;
-                (b, Some(b_ctrl), stream_len, b_ctrl_len)
+                let ctrl_len;
+
+                {
+                    let (_, mut b_ctrl) = b.split_at(payload_offset)?;
+                    push_frames_to_pkt!(b_ctrl, frames, true, self.version, false);
+                    ctrl_len = b_ctrl.off();
+                }
+
+                (b, stream_len, ctrl_len)
             }
         } else {
             if self.version == crate::PROTOCOL_VERSION_VREVERSO {
@@ -5646,11 +5659,11 @@ impl<F: BufFactory> Connection<F> {
                 let mut b_rev = OctetsMutRev::from(b);
                 push_frames_to_pkt!(b_rev, frames, false, self.version, true);
                 b = OctetsMut::from(b_rev);
-                (b, None, cumul, 0_usize)
+                (b, cumul, 0_usize)
             } else {
                 push_frames_to_pkt!(b, frames, false, self.version, false);
                 let b_len = b.off() - payload_offset;
-                (b, None, b_len, 0_usize)
+                (b, b_len, 0_usize)
             }
         };
 
@@ -5760,9 +5773,9 @@ impl<F: BufFactory> Connection<F> {
             };
 
             let written = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
-                // We encrypt with the data in inbuf and the ctrl data in
-                // extra_in, starting with the reversed stream
-                // frame
+                // The stream frames are encrypted straight from the rangebuf
+                // and the control frames are already in place behind them,
+                // starting with the reversed stream frame.
                 let rangebuf = sentry.as_ref().and_then(|v| match v {
                     std::collections::hash_map::Entry::Occupied(v) => {
                         v.get().send.rangebuf_get().map(|rb| &rb[..b_len])
@@ -5770,29 +5783,19 @@ impl<F: BufFactory> Connection<F> {
                     _ => None,
                 });
 
-                if let Some(ctrl) = ctrl {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        rangebuf,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        Some(&ctrl.as_ref()[..b_ctrl_len]),
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                } else {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        rangebuf,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        None,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                }
+                let head = match rangebuf {
+                    Some(v) => crypto::SealPiece::OutOfPlace(v),
+                    None => crypto::SealPiece::InPlace { len: b_len },
+                };
+
+                packet::encrypt_pkt(
+                    &mut b_start,
+                    pn,
+                    payload_offset,
+                    head,
+                    crypto::SealPiece::InPlace { len: b_ctrl_len },
+                    aead,
+                )?
             } else {
                 let rangebuf = sentry.as_ref().and_then(|v| match v {
                     std::collections::hash_map::Entry::Occupied(v) => {
@@ -5800,31 +5803,22 @@ impl<F: BufFactory> Connection<F> {
                     },
                     _ => None,
                 });
-                // We encrypt with the data in extra_in and the ctrl in inbuf,
-                // with the stream header at the end of the ctrl.
-                if let Some(ctrl) = ctrl {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        Some(ctrl.as_ref()),
-                        pn,
-                        b_ctrl_len,
-                        payload_offset,
-                        rangebuf,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                } else {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        None,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        rangebuf,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                }
+                // In V1 the control frames come first, written in place at the
+                // head of the payload, and the stream frames follow from the
+                // rangebuf, with the stream header at the end of the ctrl.
+                let tail = match rangebuf {
+                    Some(v) => crypto::SealPiece::OutOfPlace(v),
+                    None => crypto::SealPiece::InPlace { len: 0 },
+                };
+
+                packet::encrypt_pkt(
+                    &mut b_start,
+                    pn,
+                    payload_offset,
+                    crypto::SealPiece::InPlace { len: b_ctrl_len },
+                    tail,
+                    aead,
+                )?
             };
 
             // Update the stream's send buffer and flushable status.
@@ -5836,13 +5830,11 @@ impl<F: BufFactory> Connection<F> {
         } else {
             packet::encrypt_pkt(
                 &mut b_start,
-                None,
                 pn,
-                payload_len,
                 payload_offset,
-                None,
+                crypto::SealPiece::InPlace { len: payload_len },
+                crypto::SealPiece::InPlace { len: 0 },
                 aead,
-                self.use_hidden_crypt_copy_for_zc,
             )?
         };
 
@@ -10900,13 +10892,11 @@ pub mod testing {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            conn.use_hidden_crypt_copy_for_zc,
         )?;
 
         let (mut header, payload) = b.split_at(payload_offset)?;
@@ -11825,6 +11815,7 @@ mod tests {
         assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
     }
 
+    #[cfg(feature = "ocb3")]
     #[test]
     fn handshake_ocb3() {
         let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -11874,6 +11865,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ocb3")]
     #[test]
     fn handshake_ocb3_resumption() {
         const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
@@ -11921,6 +11913,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "ocb3")]
     #[test]
     fn handshake_ocb3_resumption_0rtt() {
         let mut buf = [0; 65535];
@@ -16077,13 +16070,11 @@ mod tests {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            false,
         )
         .unwrap();
 
@@ -21800,13 +21791,11 @@ mod tests {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            false,
         )
         .expect("packet encrypt");
         let (mut header, payload) = b.split_at(payload_offset).unwrap();
