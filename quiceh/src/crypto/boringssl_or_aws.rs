@@ -4,7 +4,7 @@ use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 
 #[cfg(feature = "ocb3")]
-use ocb3::{AEctx, DecryptIO};
+use ocb3::{AEctx, DecryptIO, EncryptIO, PlainText};
 
 use libc::c_int;
 use libc::c_uint;
@@ -163,13 +163,12 @@ impl PacketKey {
             },
             #[cfg(feature = "ocb3")]
             Algorithm::OCB3_AES128 => {
-                match self.ocb3_ctx.unwrap_or_else(|| return
-                    Err(Error::CryptoFail)).ae_decrypt(DecryptIO::InPlace(buf), &nonce, ad) {
-                    Ok(()) => Ok(out_len),
-                    Err(e) => { 
-                        log::error!("decryption failed with error {:?}", e);
-                        Err(Error::CryptoFail)
+                match &self.ocb3_ctx {
+                    Some(ctx) => {
+                        ctx.ae_decrypt(DecryptIO::InPlace(buf), &nonce, ad).map_err(|_| Error::CryptoFail)?;
+                        Ok(out_len)
                     },
+                    None => return Err(Error::CryptoFail),
                 }
             },
             _ => {
@@ -225,18 +224,15 @@ impl PacketKey {
             },
             #[cfg(feature = "ocb3")]
             Algorithm::OCB3_AES128 => {
-                match self.ocb3_ctx.unwrap_or_else(|| return Err(Error::CryptoFail)).ae_decrypt(
-                    DecryptIO::OutOfPlace { in_ct: buf, out_pt: into },
-                    &nonce,
-                    ad
-                ) {
-                    Ok(()) => Ok(out_len),
-                    Err(e) => { 
-                        log::error!("decryption failed with error {:?}", e);
-                        Err(Error::CryptoFail)
+                match &self.ocb3_ctx {
+                    Some(ctx) => {
+                        ctx.ae_decrypt(DecryptIO::OutOfPlace { in_ct: buf, out_pt: into }, 
+                            &nonce,
+                            ad).map_err(|_| Error::CryptoFail)?;
+                        Ok(out_len)
                     },
+                    None => Err(Error::CryptoFail)
                 }
-
             },
             _ => {
                 log::error!("Unsupported algorithm {:?}", self.alg);
@@ -327,6 +323,30 @@ impl PacketKey {
             },
             #[cfg(feature = "ocb3")]
             Algorithm::OCB3_AES128 => {
+                if scatter_crypt {
+                    // Safety: scatter_crypt implies in_buf and extra_in are Some(&[u8])
+                    match &self.ocb3_ctx {
+                        Some(ctx) => {
+                            ctx.ae_encrypt(
+                                EncryptIO::OutOfPlace { in_pt: PlainText::Scattered(in_buf.unwrap(), extra_in.unwrap()), out: buf },
+                                &nonce,
+                                ad,
+                            ).map_err(|_| Error::CryptoFail)?;
+                        },
+                        None => return Err(Error::CryptoFail),
+                    }
+                } else {
+                    match &self.ocb3_ctx {
+                        Some(ctx) => {
+                            ctx.ae_encrypt(
+                                EncryptIO::InPlace(buf),
+                                &nonce,
+                                ad,
+                            ).map_err(|_| Error::CryptoFail)?;
+                        },
+                        None => return Err(Error::CryptoFail),
+                    }
+                }
                 Ok(in_len + out_tag_len)
             },
             _ => {

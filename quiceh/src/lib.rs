@@ -11825,7 +11825,6 @@ mod tests {
         assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
     }
 
-    #[ignore = "requires the OCB3 AEAD implementation in crypto::PacketKey"]
     #[test]
     fn handshake_ocb3() {
         let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -11838,9 +11837,9 @@ mod tests {
         config
             .set_application_protos(&[b"proto1", b"proto2"])
             .unwrap();
-        config.set_initial_max_data(30);
-        config.set_initial_max_stream_data_bidi_local(15);
-        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_data(50);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
         config.set_initial_max_streams_bidi(3);
         config.verify_peer(false);
         config.set_use_ocb3(true);
@@ -11848,28 +11847,33 @@ mod tests {
         let mut pipe = <Pipe>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        let app_server = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
         assert!(matches!(
-            app.crypto_open.as_ref().unwrap().alg(),
+            app_server.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+        
+        let app_client = &pipe.client.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app_client.crypto_open.as_ref().unwrap().alg(),
             crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
         ));
 
         assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
         pipe.advance().unwrap();
 
-        let mut b = [0; 15];
         if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
             let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
             assert_eq!((len, is_fin), (12, true));
             assert_eq!(&b[..12], b"hello, world");
             assert!(pipe.server.stream_consumed(4, len).is_ok());
         } else {
+            let mut b = [0; 15];
             assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
             assert_eq!(&b[..12], b"hello, world");
         }
     }
 
-    #[ignore = "requires the OCB3 AEAD implementation in crypto::PacketKey"]
     #[test]
     fn handshake_ocb3_resumption() {
         const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
@@ -11917,7 +11921,6 @@ mod tests {
         ));
     }
 
-    #[ignore = "requires the OCB3 AEAD implementation in crypto::PacketKey"]
     #[test]
     fn handshake_ocb3_resumption_0rtt() {
         let mut buf = [0; 65535];
