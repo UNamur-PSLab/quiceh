@@ -8404,6 +8404,10 @@ impl<F: BufFactory> Connection<F> {
             local_ocb3: self.local_transport_params.use_ocb3,
 
             resumed_ocb3: self.resumed_ocb3,
+
+            peer_wants_ocb3: self
+                .parsed_peer_transport_params
+                .then_some(self.peer_transport_params.use_ocb3),
         };
 
         if self.handshake_completed {
@@ -9968,6 +9972,26 @@ impl Default for TransportParams {
 }
 
 impl TransportParams {
+    pub(crate) fn has_use_ocb3(buf: &[u8]) -> bool {
+        let mut params = octets_rev::Octets::with_slice(buf);
+
+        while params.cap() > 0 {
+            let Ok(id) = params.get_varint() else {
+                return false;
+            };
+
+            if params.get_bytes_with_varint_length().is_err() {
+                return false;
+            }
+
+            if id == 0xff71 {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn decode(buf: &[u8], is_server: bool) -> Result<TransportParams> {
         let mut params = octets_rev::Octets::with_slice(buf);
         let mut seen_params = HashSet::new();

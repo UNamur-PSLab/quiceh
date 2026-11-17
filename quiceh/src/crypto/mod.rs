@@ -35,6 +35,9 @@ use crate::packet;
 // All the AEAD algorithms we support use 96-bit nonces.
 pub const MAX_NONCE_LEN: usize = 12;
 
+// Maximum key length across all supported AEAD algorithms (256-bit).
+pub const MAX_KEY_LEN: usize = 32;
+
 // Length of header protection mask. 9 is the max length when using
 // PROTOCOL_VERSION_VREVERSO. We need 5 with VERSION_V1.
 pub const HP_MASK_LEN: usize = 13;
@@ -161,8 +164,7 @@ impl Open {
     pub const DECRYPT: u32 = 0;
 
     pub fn new(
-        alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>,
-        secret: Vec<u8>,
+        alg: Algorithm, key: &[u8], iv: &[u8], hp_key: &[u8], secret: Vec<u8>,
     ) -> Result<Open> {
         Ok(Open {
             alg,
@@ -191,6 +193,7 @@ impl Open {
         self.alg
     }
 
+    #[inline]
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; HP_MASK_LEN]> {
         if cfg!(feature = "fuzzing") {
             return Ok(<[u8; HP_MASK_LEN]>::default());
@@ -216,6 +219,7 @@ impl Open {
         })
     }
 
+    #[inline]
     pub fn open_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -234,6 +238,7 @@ impl Open {
         self.packet.open_with_u64_counter(counter, ad, buf)
     }
 
+    #[inline]
     pub fn open_with_u64_counter_into(
         &self, counter: u64, ad: &[u8], buf: &[u8], into: &mut [u8],
     ) -> Result<usize> {
@@ -260,6 +265,7 @@ pub(crate) enum SealPiece<'a> {
 }
 
 impl SealPiece<'_> {
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             SealPiece::InPlace { len } => *len,
@@ -284,8 +290,7 @@ impl Seal {
     pub(crate) const ENCRYPT: u32 = 1;
 
     pub fn new(
-        alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>,
-        secret: Vec<u8>,
+        alg: Algorithm, key: &[u8], iv: &[u8], hp_key: &[u8], secret: Vec<u8>,
     ) -> Result<Seal> {
         Ok(Seal {
             alg,
@@ -310,6 +315,7 @@ impl Seal {
         })
     }
 
+    #[inline]
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; HP_MASK_LEN]> {
         if cfg!(feature = "fuzzing") {
             return Ok(<[u8; HP_MASK_LEN]>::default());
@@ -341,6 +347,7 @@ impl Seal {
 
     /// Encrypts `head` followed by `tail` as a single payload, writing the
     /// ciphertext and the tag at the start of `buf`.
+    #[inline]
     pub fn seal_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8], head: SealPiece,
         tail: SealPiece,
@@ -373,11 +380,11 @@ impl HeaderProtectionKey {
     pub fn from_secret(aead: Algorithm, secret: &[u8]) -> Result<Self> {
         let key_len = aead.key_len();
 
-        let mut hp_key = vec![0; key_len];
+        let mut hp_key = [0; MAX_KEY_LEN];
 
-        derive_hdr_key(aead, secret, &mut hp_key)?;
+        derive_hdr_key(aead, secret, &mut hp_key[..key_len])?;
 
-        Self::new(aead, hp_key)
+        Self::new(aead, &hp_key[..key_len])
     }
 }
 
@@ -420,32 +427,56 @@ pub fn derive_initial_key_material(
     }
 
     // Client.
-    let mut client_key = vec![0; key_len];
-    let mut client_iv = vec![0; nonce_len];
-    let mut client_hp_key = vec![0; key_len];
+    let mut client_key = [0; MAX_KEY_LEN];
+    let mut client_iv = [0; MAX_NONCE_LEN];
+    let mut client_hp_key = [0; MAX_KEY_LEN];
 
-    derive_pkt_key(aead, &client_secret, &mut client_key)?;
-    derive_pkt_iv(aead, &client_secret, &mut client_iv)?;
-    derive_hdr_key(aead, &client_secret, &mut client_hp_key)?;
+    derive_pkt_key(aead, &client_secret, &mut client_key[..key_len])?;
+    derive_pkt_iv(aead, &client_secret, &mut client_iv[..nonce_len])?;
+    derive_hdr_key(aead, &client_secret, &mut client_hp_key[..key_len])?;
 
     // Server.
-    let mut server_key = vec![0; key_len];
-    let mut server_iv = vec![0; nonce_len];
-    let mut server_hp_key = vec![0; key_len];
+    let mut server_key = [0; MAX_KEY_LEN];
+    let mut server_iv = [0; MAX_NONCE_LEN];
+    let mut server_hp_key = [0; MAX_KEY_LEN];
 
-    derive_pkt_key(aead, &server_secret, &mut server_key)?;
-    derive_pkt_iv(aead, &server_secret, &mut server_iv)?;
-    derive_hdr_key(aead, &server_secret, &mut server_hp_key)?;
+    derive_pkt_key(aead, &server_secret, &mut server_key[..key_len])?;
+    derive_pkt_iv(aead, &server_secret, &mut server_iv[..nonce_len])?;
+    derive_hdr_key(aead, &server_secret, &mut server_hp_key[..key_len])?;
 
     let (open, seal) = if is_server {
         (
-            Open::new(aead, client_key, client_iv, client_hp_key, client_secret)?,
-            Seal::new(aead, server_key, server_iv, server_hp_key, server_secret)?,
+            Open::new(
+                aead,
+                &client_key[..key_len],
+                &client_iv[..nonce_len],
+                &client_hp_key[..key_len],
+                client_secret,
+            )?,
+            Seal::new(
+                aead,
+                &server_key[..key_len],
+                &server_iv[..nonce_len],
+                &server_hp_key[..key_len],
+                server_secret,
+            )?,
         )
     } else {
         (
-            Open::new(aead, server_key, server_iv, server_hp_key, server_secret)?,
-            Seal::new(aead, client_key, client_iv, client_hp_key, client_secret)?,
+            Open::new(
+                aead,
+                &server_key[..key_len],
+                &server_iv[..nonce_len],
+                &server_hp_key[..key_len],
+                server_secret,
+            )?,
+            Seal::new(
+                aead,
+                &client_key[..key_len],
+                &client_iv[..nonce_len],
+                &client_hp_key[..key_len],
+                client_secret,
+            )?,
         )
     };
 
@@ -547,9 +578,9 @@ fn hkdf_expand_label(
     Ok(())
 }
 
-fn make_nonce(iv: &[u8], counter: u64) -> [u8; MAX_NONCE_LEN] {
-    let mut nonce = [0; MAX_NONCE_LEN];
-    nonce.copy_from_slice(iv);
+#[inline]
+fn make_nonce(iv: &[u8; MAX_NONCE_LEN], counter: u64) -> [u8; MAX_NONCE_LEN] {
+    let mut nonce = *iv;
 
     // XOR the last bytes of the IV with the counter. This is equivalent to
     // left-padding the counter with zero bytes.

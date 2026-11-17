@@ -855,6 +855,7 @@ pub fn decode_pkt_offset(
     decode_pkt_num(largest_offset, truncated_offset, offset_len)
 }
 
+#[inline]
 pub fn decrypt_pkt_v3<'a>(
     b: &'a mut octets_rev::OctetsMut, pn: u64, hdr_enc_len: usize,
     payload_len: usize, outbuf: Option<&'a mut [u8]>, aead: &crypto::Open,
@@ -890,6 +891,7 @@ pub fn decrypt_pkt_v3<'a>(
     }
 }
 
+#[inline]
 pub fn decrypt_pkt<'a>(
     b: &'a mut octets_rev::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     aead: &crypto::Open,
@@ -982,6 +984,7 @@ pub fn encrypt_hdr(
     encrypt_hdr_inner(first, rest, enc_len, payload, aead, version)
 }
 
+#[inline]
 pub fn encrypt_pkt(
     b: &mut octets_rev::OctetsMut, pn: u64, payload_offset: usize,
     head: crypto::SealPiece, tail: crypto::SealPiece, aead: &crypto::Seal,
@@ -1177,8 +1180,8 @@ fn compute_retry_integrity_tag(
 
     let key = crypto::PacketKey::new(
         RETRY_AEAD_ALG,
-        key.to_vec(),
-        nonce.to_vec(),
+        key,
+        &nonce,
         crypto::Seal::ENCRYPT,
     )?;
 

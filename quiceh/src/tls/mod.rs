@@ -711,6 +711,10 @@ pub struct ExData<'a> {
     /// was OCB3. Only meaningful for 0-RTT key derivation, where the peer's
     /// transport parameters for this session are not available yet.
     pub resumed_ocb3: bool,
+
+    /// Cached result of whether the peer's transport parameters for the
+    /// current handshake include the `use_ocb3` flag.
+    pub peer_wants_ocb3: Option<bool>,
 }
 
 fn get_ex_data_from_ptr<'a, T>(ptr: *const SSL, idx: c_int) -> Option<&'a mut T> {
@@ -735,7 +739,11 @@ fn get_cipher_from_ptr(cipher: *const SSL_CIPHER) -> Result<crypto::Algorithm> {
 
 /// Whether the peer's transport parameters (as exposed by the TLS library
 /// for the current handshake) include the `use_ocb3` flag.
-fn peer_wants_ocb3(ssl: *mut SSL, is_server: bool) -> bool {
+fn peer_wants_ocb3(ssl: *mut SSL, ex_data: &mut ExData) -> bool {
+    if let Some(v) = ex_data.peer_wants_ocb3 {
+        return v;
+    }
+
     let mut ptr: *const u8 = ptr::null();
     let mut len: usize = 0;
 
@@ -748,11 +756,9 @@ fn peer_wants_ocb3(ssl: *mut SSL, is_server: bool) -> bool {
     }
 
     let raw = unsafe { slice::from_raw_parts(ptr, len) };
-
-    match super::TransportParams::decode(raw, is_server) {
-        Ok(tp) => tp.use_ocb3,
-        Err(_) => false,
-    }
+    let wants = super::TransportParams::has_use_ocb3(raw);
+    ex_data.peer_wants_ocb3 = Some(wants);
+    wants
 }
 
 /// Whether OCB3 must be used to protect the keys of the given level.
@@ -764,21 +770,44 @@ fn peer_wants_ocb3(ssl: *mut SSL, is_server: bool) -> bool {
 /// session state instead: the client uses the effective decision stored in
 /// the session buffer, the server uses the client's parameters embedded in
 /// the ticket.
-fn use_ocb3(ssl: *mut SSL, ex_data: &ExData, level: crypto::Level) -> bool {
+fn use_ocb3(ssl: *mut SSL, ex_data: &mut ExData, level: crypto::Level) -> bool {
+    if !ex_data.local_ocb3 {
+        return false;
+    }
+
     match level {
         crypto::Level::Initial | crypto::Level::Handshake => false,
 
         crypto::Level::ZeroRTT => {
             if ex_data.is_server {
-                ex_data.local_ocb3 && peer_wants_ocb3(ssl, ex_data.is_server)
+                peer_wants_ocb3(ssl, ex_data)
             } else {
-                ex_data.local_ocb3 && ex_data.resumed_ocb3
+                ex_data.resumed_ocb3
             }
         },
 
-        crypto::Level::OneRTT => {
-            ex_data.local_ocb3 && peer_wants_ocb3(ssl, ex_data.is_server)
-        },
+        crypto::Level::OneRTT => peer_wants_ocb3(ssl, ex_data),
+    }
+}
+
+fn select_aead(
+    ssl: *mut SSL, ex_data: &mut ExData, level: crypto::Level,
+    cipher: *const SSL_CIPHER,
+) -> Result<crypto::Algorithm> {
+    let ocb3 = use_ocb3(ssl, ex_data, level);
+    let alg = get_cipher_from_ptr(cipher)?;
+
+    // OCB3 rides on the block cipher of the negotiated AEAD. Without
+    // a block cipher underneath (ChaCha20) the negotiated AEAD is
+    // kept, and the handshake fails once it completes.
+    if ocb3 {
+        Ok(match alg {
+            crypto::Algorithm::AES128_GCM => crypto::Algorithm::OCB3_AES128,
+            crypto::Algorithm::AES256_GCM => crypto::Algorithm::OCB3_AES256,
+            _ => alg,
+        })
+    } else {
+        Ok(alg)
     }
 }
 
@@ -795,7 +824,11 @@ extern "C" fn set_read_secret(
 
     trace!("{} set read secret lvl={:?}", ex_data.trace_id, level);
 
-    let ocb3 = use_ocb3(ssl, ex_data, level);
+    let aead = match select_aead(ssl, ex_data, level, cipher) {
+        Ok(v) => v,
+
+        Err(_) => return 0,
+    };
 
     let space = match level {
         crypto::Level::Initial =>
@@ -806,29 +839,6 @@ extern "C" fn set_read_secret(
             &mut ex_data.pkt_num_spaces[packet::Epoch::Handshake],
         crypto::Level::OneRTT =>
             &mut ex_data.pkt_num_spaces[packet::Epoch::Application],
-    };
-
-    let aead = match get_cipher_from_ptr(cipher) {
-        Ok(v) => {
-            // OCB3 rides on the block cipher of the negotiated AEAD. Without
-            // a block cipher underneath (ChaCha20) the negotiated AEAD is
-            // kept, and the handshake fails once it completes.
-            if ocb3 {
-                match v {
-                    crypto::Algorithm::AES128_GCM => {
-                        crypto::Algorithm::OCB3_AES128
-                    }
-                    crypto::Algorithm::AES256_GCM => {
-                        crypto::Algorithm::OCB3_AES256
-                    }
-                    _ => v,
-                }
-            } else {
-                v
-            }
-        },
-
-        Err(_) => return 0,
     };
 
     // 0-RTT read secrets are present only on the server.
@@ -865,7 +875,11 @@ extern "C" fn set_write_secret(
 
     trace!("{} set write secret lvl={:?}", ex_data.trace_id, level);
 
-    let ocb3 = use_ocb3(ssl, ex_data, level);
+    let aead = match select_aead(ssl, ex_data, level, cipher) {
+        Ok(v) => v,
+
+        Err(_) => return 0,
+    };
 
     let space = match level {
         crypto::Level::Initial =>
@@ -876,29 +890,6 @@ extern "C" fn set_write_secret(
             &mut ex_data.pkt_num_spaces[packet::Epoch::Handshake],
         crypto::Level::OneRTT =>
             &mut ex_data.pkt_num_spaces[packet::Epoch::Application],
-    };
-
-    let aead = match get_cipher_from_ptr(cipher) {
-        Ok(v) => {
-            // OCB3 rides on the block cipher of the negotiated AEAD. Without
-            // a block cipher underneath (ChaCha20) the negotiated AEAD is
-            // kept, and the handshake fails once it completes.
-            if ocb3 {
-                match v {
-                    crypto::Algorithm::AES128_GCM => {
-                        crypto::Algorithm::OCB3_AES128
-                    }
-                    crypto::Algorithm::AES256_GCM => {
-                        crypto::Algorithm::OCB3_AES256
-                    }
-                    _ => v,
-                }
-            } else {
-                v
-            }
-        },
-
-        Err(_) => return 0,
     };
 
     // 0-RTT write secrets are present only on the client.
@@ -1115,15 +1106,14 @@ extern "C" fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
     // 0-RTT keys must be protected with the same AEAD as the original
     // session, and the connection must fail if an OCB3 session can no longer
     // be honored.
-    let peer_wants_ocb3 = match super::TransportParams::decode(
-        peer_params,
-        ex_data.is_server,
-    ) {
-        Ok(tp) => tp.use_ocb3,
-        Err(_) => false,
+    let effective_ocb3 = if ex_data.local_ocb3 {
+        let peer_wants = *ex_data
+            .peer_wants_ocb3
+            .get_or_insert_with(|| super::TransportParams::has_use_ocb3(peer_params));
+        u8::from(peer_wants)
+    } else {
+        0
     };
-
-    let effective_ocb3 = (ex_data.local_ocb3 && peer_wants_ocb3) as u8;
 
     if buffer.write(&[effective_ocb3]).is_err() {
         std::mem::forget(handshake);
