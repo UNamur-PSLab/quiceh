@@ -4,7 +4,7 @@ use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 
 #[cfg(feature = "ocb3")]
-use ocb3::{AEctx, DecryptIO, EncryptIO, PlainText};
+use ocb3::{AEctx, DecryptIO, EncryptIO, PlainText, Placement};
 
 use libc::c_int;
 use libc::c_uint;
@@ -343,31 +343,27 @@ impl PacketKey {
                     SealPiece::OutOfPlace(v) if !v.is_empty() => Some(*v),
                     _ => None,
                 };
-
-                // A piece that is not read from outside still contributes to
-                // the plaintext when it is non-empty, in which case it
-                // overlaps the destination.
+                // in-place head
                 let head_pinned = head_src.is_none() && head_len > 0;
+                // in-place tail
                 let tail_pinned = tail_src.is_none() && tail_len > 0;
 
-                let result = if head_pinned || tail_pinned {
-                    if head_src.is_some() || tail_src.is_some() {
-                        // One piece sits inside the destination while the
-                        // other sits outside it. ocb3 takes the plaintext
-                        // pieces as shared slices and the destination as a
-                        // mutable one, so the overlap has no safe spelling;
-                        // supporting it needs an ocb3 API that reads a head
-                        // from outside while encrypting the rest in place.
-                        log::error!(
-                            "ocb3 cannot seal {} in-place bytes next to {} bytes read from outside the destination",
-                            if head_pinned { head_len } else { tail_len },
-                            if head_pinned { tail_len } else { head_len },
-                        );
+                // Exactly one half sits in the destination while the other is read from
+                // outside: the outside one is `part`, the pinned one stays in `out`. Two
+                // pinned halves, or a pinned half beside an empty one, leave the whole
+                // payload in `buf` and are encrypted in place below.
+                let mixed = match (head_pinned, tail_pinned) {
+                    (true, false) => tail_src.map(|t| (t, Placement::Tail)),
+                    (false, true) => head_src.map(|h| (h, Placement::Head)),
+                    _ => None,
+                };
 
-                        return Err(Error::CryptoFail);
-                    }
-
-                    ctx.ae_encrypt(EncryptIO::InPlace(payload), &nonce, ad)
+                let result = if let Some((part, at)) = mixed {
+                    ctx.ae_encrypt(
+                        EncryptIO::MixedPlace { out: payload, part, at },
+                        &nonce,
+                        ad,
+                    )
                 } else if let (Some(h), Some(t)) = (head_src, tail_src) {
                     ctx.ae_encrypt(
                         EncryptIO::OutOfPlace {
