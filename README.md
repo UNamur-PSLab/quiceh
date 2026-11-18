@@ -66,6 +66,12 @@ zero-copy in a QUIC packet using BoringSSL's scatter encryption. This
 has a currently limited performance improvement for large blobs of data
 and much lower performance for sending small blobs of data.
 
+- OCB3 can override the negotiation of AES-GCM if both peers ask it
+  within a new transport parameter. This method is temporary until
+  support eventually land within TLS. In case OCB3 is negotiated,
+  [`enable_hidden_copy_for_zc_sender()`] makes the sender slightly more
+  efficient.
+
 Using quiceh 
 ------------
 

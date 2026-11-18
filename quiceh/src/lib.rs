@@ -1330,6 +1330,21 @@ impl Config {
         self.local_transport_params.disable_active_migration = v;
     }
 
+    /// Sets the `use_ocb3` transport parameter.
+    ///
+    /// When enabled on both endpoints, the post-handshake (and 0-RTT)
+    /// packet protection uses OCB3 instead of the AEAD of the cipher suite
+    /// negotiated by TLS. This is for testing only.
+    ///
+    /// In a fresh handshake, a disagreement on the flag results in the
+    /// negotiated cipher being used. When resuming a session that used
+    /// OCB3, the connection fails if the flag can no longer be honored.
+    ///
+    /// The default value is `false`.
+    pub fn set_use_ocb3(&mut self, v: bool) {
+        self.local_transport_params.use_ocb3 = v;
+    }
+
     /// Sets the congestion control algorithm used by string.
     ///
     /// The default value is `cubic`. On error `Error::CongestionControl`
@@ -1489,6 +1504,11 @@ where
     /// This field is populated when a new session ticket is processed on the
     /// client. On the server this is empty.
     session: Option<Vec<u8>>,
+
+    /// Whether this connection is resuming a session whose effective AEAD
+    /// was OCB3, as recorded in the serialized session buffer. Only set on
+    /// the client, via [`Connection::set_session`].
+    resumed_ocb3: bool,
 
     /// The configuration for recovery.
     recovery_config: recovery::RecoveryConfig,
@@ -2191,6 +2211,8 @@ impl<F: BufFactory> Connection<F> {
 
             session: None,
 
+            resumed_ocb3: false,
+
             recovery_config,
 
             paths,
@@ -2499,7 +2521,19 @@ impl<F: BufFactory> Connection<F> {
         let peer_params =
             TransportParams::decode(raw_params_bytes.as_ref(), self.is_server)?;
 
+        // Trailing byte recording whether the original session used OCB3.
+        // Missing on session buffers written before that field existed.
+        let resumed_ocb3 = b.cap() >= 1 && b.get_u8()? == 1;
+
+        // A session that used OCB3 cannot be resumed if we no longer want to
+        // use OCB3; the 0-RTT keys would no longer be protected consistently.
+        if resumed_ocb3 && !self.local_transport_params.use_ocb3 {
+            return Err(Error::InvalidTransportParam);
+        }
+
         self.process_peer_transport_params(peer_params)?;
+
+        self.resumed_ocb3 = resumed_ocb3;
 
         Ok(())
     }
@@ -5544,7 +5578,12 @@ impl<F: BufFactory> Connection<F> {
         // The data will be send without copy; ctrl information are written
         // inside this buffer with the goal to encrypt them next to the zero-copy
         // encryted data, in out.
-        let (mut b_start, ctrl, b_len, b_ctrl_len) = if self
+        // The payload pieces are described to the AEAD relative to `b_start`,
+        // which therefore keeps covering the whole packet: `b_len` bytes of
+        // stream frames come from the rangebuf when there is one, and the
+        // `b_ctrl_len` bytes of control frames are already in place inside the
+        // destination.
+        let (mut b_start, b_len, b_ctrl_len) = if self
             .use_hidden_crypt_copy_for_zc
         {
             // If we're in VReverso, the frame should be first.
@@ -5561,22 +5600,25 @@ impl<F: BufFactory> Connection<F> {
                 trace!("frames {:?}", frames);
                 // ctrl cleartext is written inside the destination buffer,
                 // aligned on a multiple of the AES blocksize.
+                let ctrl_len = cumul - stream_len;
 
-                let (b, mut b_ctrl) = b.split_at(payload_offset + stream_len)?;
-                trace!(
-                    "split_at: {}; skipping {} bytes",
-                    payload_offset + stream_len,
-                    cumul - stream_len
-                );
-                b_ctrl.skip(cumul - stream_len)?;
-                let mut b_ctrl_rev = OctetsMutRev::from(b_ctrl);
-                push_frames_to_pkt!(b_ctrl_rev, frames, true, self.version, true);
-                b_ctrl = OctetsMut::from(b_ctrl_rev);
-                trace!("b_ctrl off at {}", b_ctrl.off());
-                (b, Some(b_ctrl), stream_len, cumul - stream_len)
+                {
+                    let (_, mut b_ctrl) =
+                        b.split_at(payload_offset + stream_len)?;
+                    trace!(
+                        "split_at: {}; skipping {} bytes",
+                        payload_offset + stream_len,
+                        ctrl_len
+                    );
+                    b_ctrl.skip(ctrl_len)?;
+                    let mut b_ctrl_rev = OctetsMutRev::from(b_ctrl);
+                    push_frames_to_pkt!(b_ctrl_rev, frames, true, self.version, true);
+                    trace!("b_ctrl off at {}", b_ctrl_rev.off());
+                }
+
+                (b, stream_len, ctrl_len)
             } else {
                 // In V1 we would start with the ctrl.
-                let (b, mut b_ctrl) = b.split_at(payload_offset)?;
                 // The StreamHeader frame should be last.
                 let stream_len = if let Some(frame) = &maybe_stream_header {
                     let frame_len = frame.wire_len();
@@ -5601,10 +5643,15 @@ impl<F: BufFactory> Connection<F> {
                     0_usize
                 };
 
-                push_frames_to_pkt!(b_ctrl, frames, true, self.version, false);
-                let b_ctrl_len = b_ctrl.off();
-                b_ctrl.rewind(b_ctrl_len)?;
-                (b, Some(b_ctrl), stream_len, b_ctrl_len)
+                let ctrl_len;
+
+                {
+                    let (_, mut b_ctrl) = b.split_at(payload_offset)?;
+                    push_frames_to_pkt!(b_ctrl, frames, true, self.version, false);
+                    ctrl_len = b_ctrl.off();
+                }
+
+                (b, stream_len, ctrl_len)
             }
         } else {
             if self.version == crate::PROTOCOL_VERSION_VREVERSO {
@@ -5612,11 +5659,11 @@ impl<F: BufFactory> Connection<F> {
                 let mut b_rev = OctetsMutRev::from(b);
                 push_frames_to_pkt!(b_rev, frames, false, self.version, true);
                 b = OctetsMut::from(b_rev);
-                (b, None, cumul, 0_usize)
+                (b, cumul, 0_usize)
             } else {
                 push_frames_to_pkt!(b, frames, false, self.version, false);
                 let b_len = b.off() - payload_offset;
-                (b, None, b_len, 0_usize)
+                (b, b_len, 0_usize)
             }
         };
 
@@ -5705,96 +5752,48 @@ impl<F: BufFactory> Connection<F> {
         };
 
         let written = if self.use_hidden_crypt_copy_for_zc {
-            let sentry = if self.version == crate::PROTOCOL_VERSION_VREVERSO {
-                if let Some(frame::Frame::StreamHeader { stream_id, .. }) =
-                    frames.first()
-                {
-                    Some(self.streams.entry(*stream_id))
-                } else {
-                    None
-                }
-            } else if self.version == crate::PROTOCOL_VERSION_V1 {
-                if let Some(frame::Frame::StreamHeader { stream_id, .. }) =
-                    &maybe_stream_header
-                {
-                    Some(self.streams.entry(*stream_id))
-                } else {
-                    None
-                }
-            } else {
-                None
+            let stream_id = match &maybe_stream_header {
+                Some(frame::Frame::StreamHeader { stream_id, .. }) => {
+                    Some(*stream_id)
+                },
+                _ => None,
             };
 
-            let written = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
-                // We encrypt with the data in inbuf and the ctrl data in
-                // extra_in, starting with the reversed stream
-                // frame
-                let rangebuf = sentry.as_ref().and_then(|v| match v {
-                    std::collections::hash_map::Entry::Occupied(v) => {
-                        v.get().send.rangebuf_get().map(|rb| &rb[..b_len])
-                    },
-                    _ => None,
-                });
-
-                if let Some(ctrl) = ctrl {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        rangebuf,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        Some(&ctrl.as_ref()[..b_ctrl_len]),
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                } else {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        rangebuf,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        None,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                }
-            } else {
-                let rangebuf = sentry.as_ref().and_then(|v| match v {
-                    std::collections::hash_map::Entry::Occupied(v) => {
-                        v.get().send.rangebuf_get().map(|rb| &rb[..b_len])
-                    },
-                    _ => None,
-                });
-                // We encrypt with the data in extra_in and the ctrl in inbuf,
-                // with the stream header at the end of the ctrl.
-                if let Some(ctrl) = ctrl {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        Some(ctrl.as_ref()),
-                        pn,
-                        b_ctrl_len,
-                        payload_offset,
-                        rangebuf,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                } else {
-                    packet::encrypt_pkt(
-                        &mut b_start,
-                        None,
-                        pn,
-                        b_len,
-                        payload_offset,
-                        rangebuf,
-                        aead,
-                        self.use_hidden_crypt_copy_for_zc,
-                    )?
-                }
+            let rangebuf = match stream_id {
+                Some(sid) => self
+                    .streams
+                    .get(sid)
+                    .and_then(|s| s.send.rangebuf_get())
+                    .map(|rb| &rb[..b_len]),
+                None => None,
             };
+
+            let stream_piece = match rangebuf {
+                Some(v) => crypto::SealPiece::OutOfPlace(v),
+                None => crypto::SealPiece::InPlace { len: b_len },
+            };
+            let ctrl_piece = crypto::SealPiece::InPlace { len: b_ctrl_len };
+
+            // In VReverso, stream frames come first and control frames sit in
+            // place behind them. In V1, control frames (ending with the stream
+            // header) come first and stream frames follow from the rangebuf.
+            let (head, tail) = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
+                (stream_piece, ctrl_piece)
+            } else {
+                (ctrl_piece, stream_piece)
+            };
+
+            let written = packet::encrypt_pkt(
+                &mut b_start,
+                pn,
+                payload_offset,
+                head,
+                tail,
+                aead,
+            )?;
 
             // Update the stream's send buffer and flushable status.
-            if let Some(sid) = sentry.as_ref().map(|e| *e.key()) {
+            if let Some(sid) = stream_id {
                 self.streams.on_stream_data_sent(sid, b_len).ok();
             }
 
@@ -5802,13 +5801,11 @@ impl<F: BufFactory> Connection<F> {
         } else {
             packet::encrypt_pkt(
                 &mut b_start,
-                None,
                 pn,
-                payload_len,
                 payload_offset,
-                None,
+                crypto::SealPiece::InPlace { len: payload_len },
+                crypto::SealPiece::InPlace { len: 0 },
                 aead,
-                self.use_hidden_crypt_copy_for_zc,
             )?
         };
 
@@ -8249,6 +8246,14 @@ impl<F: BufFactory> Connection<F> {
     fn parse_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
+        // A session that used OCB3 must be resumed with OCB3: if the peer no
+        // longer advertises the flag, fail instead of silently changing the
+        // AEAD. Fresh handshakes and sessions that did not use OCB3 fall
+        // back to the negotiated cipher on disagreement.
+        if !self.is_server && self.resumed_ocb3 && !peer_params.use_ocb3 {
+            return Err(Error::InvalidTransportParam);
+        }
+
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
             Some(v) if v != &self.destination_id() => {
@@ -8366,6 +8371,14 @@ impl<F: BufFactory> Connection<F> {
             trace_id: &self.trace_id,
 
             is_server: self.is_server,
+
+            local_ocb3: self.local_transport_params.use_ocb3,
+
+            resumed_ocb3: self.resumed_ocb3,
+
+            peer_wants_ocb3: self
+                .parsed_peer_transport_params
+                .then_some(self.peer_transport_params.use_ocb3),
         };
 
         if self.handshake_completed {
@@ -8424,6 +8437,24 @@ impl<F: BufFactory> Connection<F> {
             // Once the handshake is completed there's no point in processing
             // 0-RTT packets anymore, so clear the buffer now.
             self.undecryptable_pkts.clear();
+
+            // OCB3 uses the block cipher of the negotiated AEAD. If TLS
+            // negotiated ChaCha20-Poly1305 while both peers asked for OCB3,
+            // fail explicitly instead of silently using the negotiated
+            // cipher.
+            if self.handshake.cipher()
+                == Some(crypto::Algorithm::ChaCha20_Poly1305)
+                && self.local_transport_params.use_ocb3
+                && self.peer_transport_params.use_ocb3
+            {
+                trace!(
+                    "{} OCB3 requested but negotiated cipher is {:?}",
+                    &self.trace_id,
+                    self.handshake.cipher(),
+                );
+
+                return Err(Error::InvalidTransportParam);
+            }
 
             trace!("{} connection established: proto={:?} cipher={:?} curve={:?} sigalg={:?} resumed={} {:?}",
                    &self.trace_id,
@@ -9870,6 +9901,9 @@ pub struct TransportParams {
     pub max_ack_delay: u64,
     /// Whether active migration is disabled.
     pub disable_active_migration: bool,
+    /// Whether to use OCB3 instead of the symmetric cipher being negotiated
+    /// on TLS. This is for testing only.
+    pub use_ocb3: bool,
     /// The active connection ID limit.
     pub active_conn_id_limit: u64,
     /// The value that the endpoint included in the Source CID field of a Retry
@@ -9899,6 +9933,7 @@ impl Default for TransportParams {
             ack_delay_exponent: 3,
             max_ack_delay: 25,
             disable_active_migration: false,
+            use_ocb3: false,
             active_conn_id_limit: 2,
             initial_source_connection_id: None,
             retry_source_connection_id: None,
@@ -9908,6 +9943,28 @@ impl Default for TransportParams {
 }
 
 impl TransportParams {
+    const TP_USE_OCB3: u64 = 0xff71;
+
+    pub(crate) fn has_use_ocb3(buf: &[u8]) -> bool {
+        let mut params = octets_rev::Octets::with_slice(buf);
+
+        while params.cap() > 0 {
+            let Ok(id) = params.get_varint() else {
+                return false;
+            };
+
+            let Ok(val) = params.get_bytes_with_varint_length() else {
+                return false;
+            };
+
+            if id == Self::TP_USE_OCB3 {
+                return val.cap() == 0;
+            }
+        }
+
+        false
+    }
+
     fn decode(buf: &[u8], is_server: bool) -> Result<TransportParams> {
         let mut params = octets_rev::Octets::with_slice(buf);
         let mut seen_params = HashSet::new();
@@ -10041,7 +10098,7 @@ impl TransportParams {
                     tp.initial_source_connection_id = Some(val.to_vec().into());
                 },
 
-                0x00010 => {
+                0x0010 => {
                     if is_server {
                         return Err(Error::InvalidTransportParam);
                     }
@@ -10051,6 +10108,15 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+                
+                // Used elsewhere too, so a const is defined in the module.
+                Self::TP_USE_OCB3 => {
+                    if val.cap() != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.use_ocb3 = true;
                 },
 
                 // Ignore unknown parameters.
@@ -10213,6 +10279,10 @@ impl TransportParams {
                 octets_rev::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+        
+        if tp.use_ocb3 {
+            TransportParams::encode_param(&mut b, Self::TP_USE_OCB3, 0)?;
         }
 
         let out_len = b.off();
@@ -10824,13 +10894,11 @@ pub mod testing {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            conn.use_hidden_crypt_copy_for_zc,
         )?;
 
         let (mut header, payload) = b.split_at(payload_offset)?;
@@ -11097,6 +11165,7 @@ mod tests {
             ack_delay_exponent: 20,
             max_ack_delay: 2_u64.pow(14) - 1,
             disable_active_migration: true,
+            use_ocb3: true,
             active_conn_id_limit: 8,
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: Some(b"retry".to_vec().into()),
@@ -11106,7 +11175,7 @@ mod tests {
         let mut raw_params = [42; 256];
         let raw_params =
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
-        assert_eq!(raw_params.len(), 94);
+        assert_eq!(raw_params.len(), 99);
 
         let new_tp = TransportParams::decode(raw_params, false).unwrap();
 
@@ -11127,6 +11196,7 @@ mod tests {
             ack_delay_exponent: 20,
             max_ack_delay: 2_u64.pow(14) - 1,
             disable_active_migration: true,
+            use_ocb3: false,
             active_conn_id_limit: 8,
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: None,
@@ -11176,6 +11246,29 @@ mod tests {
             TransportParams::decode(raw_params.as_slice(), true),
             Err(Error::InvalidTransportParam)
         );
+    }
+
+    #[test]
+    fn transport_params_ocb3() {
+        let mut tp = TransportParams::default();
+
+        let mut raw_params = [0; 256];
+
+        // Off: the parameter is not encoded.
+        let encoded =
+            TransportParams::encode(&tp, true, &mut raw_params).unwrap();
+        assert!(!TransportParams::decode(encoded, false).unwrap().use_ocb3);
+
+        // On: the parameter is encoded with an empty value, in ascending
+        // ID order (so last, for a default parameter set).
+        tp.use_ocb3 = true;
+
+        let encoded =
+            TransportParams::encode(&tp, true, &mut raw_params).unwrap();
+        assert!(encoded.ends_with(&[0xff, 0x71, 0x00]));
+
+        let new_tp = TransportParams::decode(encoded, false).unwrap();
+        assert!(new_tp.use_ocb3);
     }
 
     #[test]
@@ -11567,6 +11660,498 @@ mod tests {
 
         assert!(pipe.client.is_resumed());
         assert!(pipe.server.is_resumed());
+    }
+
+    #[test]
+    fn handshake_ocb3_fallback() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_streams_bidi(3);
+        config.verify_peer(false);
+
+        // Client asks for OCB3, server does not: the negotiated cipher is
+        // used.
+        let mut client_config = config.clone();
+        client_config.set_use_ocb3(true);
+
+        let mut pipe =
+            <Pipe>::with_client_and_server_config(&client_config, &config)
+                .unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+        pipe.advance().unwrap();
+
+        let mut b = [0; 15];
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (12, true));
+            assert_eq!(&b[..12], b"hello, world");
+            assert!(pipe.server.stream_consumed(4, len).is_ok());
+        } else {
+            assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
+            assert_eq!(&b[..12], b"hello, world");
+        }
+
+        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(!matches!(
+            app.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        // Server asks for OCB3, client does not: the negotiated cipher is
+        // used.
+        let mut server_config = config.clone();
+        server_config.set_use_ocb3(true);
+
+        let mut pipe =
+            <Pipe>::with_client_and_server_config(&config, &server_config)
+                .unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+        pipe.advance().unwrap();
+
+        let mut b = [0; 15];
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (12, true));
+            assert_eq!(&b[..12], b"hello, world");
+            assert!(pipe.server.stream_consumed(4, len).is_ok());
+        } else {
+            assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
+            assert_eq!(&b[..12], b"hello, world");
+        }
+
+        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(!matches!(
+            app.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+    }
+
+    #[test]
+    fn set_session_ocb3_local_disabled() {
+        const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Mark the session as one that used OCB3.
+        let mut session = pipe.client.session().unwrap().to_vec();
+        *session.last_mut().unwrap() = 1;
+
+        // Resuming it without OCB3 enabled must fail.
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(
+            pipe.client.set_session(&session),
+            Err(Error::InvalidTransportParam)
+        );
+    }
+
+    #[test]
+    fn handshake_ocb3_resumption_peer_no_ocb3() {
+        const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+
+        // Establish a session while the client only asks for OCB3.
+        let mut client_config = config.clone();
+        client_config.set_use_ocb3(true);
+
+        let mut pipe =
+            <Pipe>::with_client_and_server_config(&client_config, &config)
+                .unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Mark the session as one that used OCB3.
+        let mut session = pipe.client.session().unwrap().to_vec();
+        *session.last_mut().unwrap() = 1;
+
+        // The client still wants OCB3, so loading the session succeeds...
+        let mut client_config = config.clone();
+        client_config.set_use_ocb3(true);
+
+        let mut pipe =
+            <Pipe>::with_client_and_server_config(&client_config, &config)
+                .unwrap();
+        assert_eq!(pipe.client.set_session(&session), Ok(()));
+
+        // ...but the handshake fails as the peer does not offer OCB3.
+        assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn handshake_ocb3() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(50);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
+        config.set_initial_max_streams_bidi(3);
+        config.verify_peer(false);
+        config.set_use_ocb3(true);
+
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let app_server = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app_server.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+        
+        let app_client = &pipe.client.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app_client.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+        pipe.advance().unwrap();
+
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (12, true));
+            assert_eq!(&b[..12], b"hello, world");
+            assert!(pipe.server.stream_consumed(4, len).is_ok());
+        } else {
+            let mut b = [0; 15];
+            assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
+            assert_eq!(&b[..12], b"hello, world");
+        }
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn handshake_ocb3_resumption() {
+        const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+        config.set_use_ocb3(true);
+
+        // Perform initial handshake.
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        // Extract session, which must be marked as using OCB3.
+        let session = pipe.client.session().unwrap();
+        assert_eq!(*session.last().unwrap(), 1);
+
+        // Configure session on new connection and perform handshake.
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.client.set_session(session), Ok(()));
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert!(pipe.client.is_resumed());
+        assert!(pipe.server.is_resumed());
+
+        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn handshake_ocb3_resumption_0rtt() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_early_data();
+        config.verify_peer(false);
+        config.set_use_ocb3(true);
+
+        // Perform initial handshake.
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Extract session, which must be marked as using OCB3.
+        let session = pipe.client.session().unwrap();
+        assert_eq!(*session.last().unwrap(), 1);
+
+        // Configure session on new connection.
+        let mut pipe = <Pipe>::with_config(&config).unwrap();
+        assert_eq!(pipe.client.set_session(session), Ok(()));
+
+        // Client sends initial flight.
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+        testing::process_flight(&mut pipe.server, flight).unwrap();
+
+        // 0-RTT read keys on the server use OCB3.
+        let app = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app.crypto_0rtt_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        // Client sends 0-RTT packet.
+        let pkt_type = packet::Type::ZeroRTT;
+
+        let frames = [frame::Frame::Stream {
+            stream_id: 4,
+            data: <RangeBuf>::from(b"aaaaa", 0, true),
+        }];
+
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Ok(1200)
+        );
+
+        assert_eq!(pipe.server.undecryptable_pkts.len(), 0);
+
+        // 0-RTT stream data is readable.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 15];
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (5, true));
+            assert_eq!(&b[..5], b"aaaaa");
+            assert!(pipe.server.stream_consumed(4, len).is_ok());
+        } else {
+            assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((5, true)));
+            assert_eq!(&b[..5], b"aaaaa");
+        }
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn ocb3_hidden_copy_zc() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_hidden_copy_for_zc_sender(true);
+        config.verify_peer(false);
+        config.set_use_ocb3(true);
+
+        let mut pipe = Pipe::<BufTestFactory>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let app_server = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app_server.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        assert_eq!(pipe.client.stream_send(8, b"hello, world", false), Ok(12));
+        assert_eq!(
+            pipe.client.stream_send_zc(
+                8,
+                BufTestFactory::buf_from_slice(b"ciao, world"),
+                Some(11),
+                true,
+            ),
+            Ok((11, None))
+        );
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
+            assert_eq!(b, b"hello, worldciao, world");
+            assert_eq!((len, fin), (23, true));
+            assert!(pipe.server.stream_consumed(8, len).is_ok());
+        } else {
+            let mut buf = [0; 32];
+            assert_eq!(pipe.server.stream_recv(8, &mut buf), Ok((23, true)));
+            assert_eq!(&buf[..23], b"hello, worldciao, world");
+        }
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn ocb3_chunk_boundary_out_of_place_decrypt() {
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let mut buf = [0; 65535];
+            let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+            config
+                .load_cert_chain_from_pem_file("examples/cert.crt")
+                .unwrap();
+            config
+                .load_priv_key_from_pem_file("examples/cert.key")
+                .unwrap();
+            config
+                .set_application_protos(&[b"proto1", b"proto2"])
+                .unwrap();
+            config.set_initial_max_data(10 * 32 * 1024);
+            config.set_initial_max_streams_bidi(3);
+            config.set_initial_max_stream_data_bidi_local(10 * 32 * 1024);
+            config.set_initial_max_stream_data_bidi_remote(10 * 32 * 1024);
+            config.set_expected_chunklen_to_consume(PAYLOAD_MIN_LEN_WITH_TAG);
+            config.verify_peer(false);
+            config.set_use_ocb3(true);
+
+            let mut pipe = <Pipe>::with_config(&config).unwrap();
+            assert_eq!(pipe.handshake(), Ok(()));
+
+            let app_server =
+                &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+            assert!(matches!(
+                app_server.crypto_open.as_ref().unwrap().alg(),
+                crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+            ));
+
+            let frames = [
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(b"aaaaaaaaaaaa", 0, false),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(b"bbbbbbbbbbbbb", 12, false),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(
+                        b"bbbbbbbbbbbbbbbbbbbbbbbbb",
+                        25,
+                        false,
+                    ),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(
+                        b"cccccccccccccccccccccccccccccccc",
+                        50,
+                        true,
+                    ),
+                },
+            ];
+
+            let pkt_type = packet::Type::Short;
+
+            // Send first 12 bytes at offset 0 (partial chunk).
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[0].clone()], &mut buf)
+                .is_ok());
+
+            let (_, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (12, false));
+
+            // Fill the rest of the 25-byte chunk with 13 bytes at offset 12.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[1].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"aaaaaaaaaaaabbbbbbbbbbbbb");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            // Send an exact 25-byte chunk at offset 25.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[2].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"bbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            // Send 32 bytes at offset 50, spilling across chunk boundaries.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[3].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"ccccccccccccccccccccccccc");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (7, true));
+            assert_eq!(&b[..], b"ccccccc");
+            assert!(pipe.server.stream_consumed(4, 7).is_ok());
+        }
     }
 
     #[test]
@@ -15648,13 +16233,11 @@ mod tests {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            false,
         )
         .unwrap();
 
@@ -19673,6 +20256,7 @@ mod tests {
 
         let mut pipe = <Pipe>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
 
         let scid = pipe.client.source_id().into_owned();
 
@@ -19691,6 +20275,12 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
+        if let Some(timer) = pipe.client.timeout() {
+            std::thread::sleep(timer + time::Duration::from_millis(1));
+            pipe.client.on_timeout();
+            assert_eq!(pipe.advance(), Ok(()));
+        }
+
         // At this point, the server should be notified that it has a new CID.
         assert_eq!(pipe.server.available_dcids(), 1);
 
@@ -19708,6 +20298,12 @@ mod tests {
 
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
+
+        if let Some(timer) = pipe.server.timeout() {
+            std::thread::sleep(timer + time::Duration::from_millis(1));
+            pipe.server.on_timeout();
+            assert_eq!(pipe.advance(), Ok(()));
+        }
 
         assert_eq!(pipe.client.retired_scid_next(), Some(scid));
         assert_eq!(pipe.client.retired_scid_next(), None);
@@ -21371,13 +21967,11 @@ mod tests {
 
         let written = packet::encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             aead,
-            false,
         )
         .expect("packet encrypt");
         let (mut header, payload) = b.split_at(payload_offset).unwrap();

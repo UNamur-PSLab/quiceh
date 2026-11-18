@@ -36,6 +36,9 @@ internal = []
 # For example
 current_thread = []
 
+# override symmetric crypto to ocb3.
+ocb3 = ["dep:ocb3"]
+
 [package.metadata.docs.rs]
 no-default-features = true
 features = ["boringssl-boring-crate", "qlog"]
@@ -53,6 +56,7 @@ libm = "0.2"
 slab = "0.4"
 once_cell = "1"
 octets_rev = { version = "1.0.0", path = "../octets_rev" }
+ocb3 = { git = "https://github.com/UNamur-PSLab/ocb3", optional = true }
 boring = { version = "4", optional = true }
 boring-sys = { version = "4", optional = true }
 aws-lc-sys = { version = "0.44", optional = true, features = ["ssl"] }

@@ -35,6 +35,9 @@ use crate::packet;
 // All the AEAD algorithms we support use 96-bit nonces.
 pub const MAX_NONCE_LEN: usize = 12;
 
+// Maximum key length across all supported AEAD algorithms (256-bit).
+pub const MAX_KEY_LEN: usize = 32;
+
 // Length of header protection mask. 9 is the max length when using
 // PROTOCOL_VERSION_VREVERSO. We need 5 with VERSION_V1.
 pub const HP_MASK_LEN: usize = 13;
@@ -70,6 +73,17 @@ pub enum Algorithm {
 
     #[allow(non_camel_case_types)]
     ChaCha20_Poly1305,
+
+    /// OCB3 using AES-128. Experimental, for testing only: used as a
+    /// drop-in replacement for the negotiated AEAD for post-handshake
+    /// (and 0-RTT) packet protection when both peers agreed on it via
+    /// transport parameters.
+    #[allow(non_camel_case_types)]
+    OCB3_AES128,
+
+    /// OCB3 using AES-256. See [`Algorithm::OCB3_AES128`].
+    #[allow(non_camel_case_types)]
+    OCB3_AES256,
 }
 
 impl Algorithm {
@@ -77,16 +91,20 @@ impl Algorithm {
     // submodule (openssl-quictls / boringssl).
     fn get_evp_digest(self) -> *const EVP_MD {
         match self {
-            Algorithm::AES128_GCM => unsafe { EVP_sha256() },
-            Algorithm::AES256_GCM => unsafe { EVP_sha384() },
+            Algorithm::AES128_GCM | Algorithm::OCB3_AES128 => {
+                unsafe { EVP_sha256() }
+            },
+            Algorithm::AES256_GCM | Algorithm::OCB3_AES256 => {
+                unsafe { EVP_sha384() }
+            },
             Algorithm::ChaCha20_Poly1305 => unsafe { EVP_sha256() },
         }
     }
 
     pub const fn key_len(self) -> usize {
         match self {
-            Algorithm::AES128_GCM => 16,
-            Algorithm::AES256_GCM => 32,
+            Algorithm::AES128_GCM | Algorithm::OCB3_AES128 => 16,
+            Algorithm::AES256_GCM | Algorithm::OCB3_AES256 => 32,
             Algorithm::ChaCha20_Poly1305 => 32,
         }
     }
@@ -97,17 +115,21 @@ impl Algorithm {
         }
 
         match self {
-            Algorithm::AES128_GCM => 16,
-            Algorithm::AES256_GCM => 16,
-            Algorithm::ChaCha20_Poly1305 => 16,
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::ChaCha20_Poly1305
+            | Algorithm::OCB3_AES128
+            | Algorithm::OCB3_AES256 => 16,
         }
     }
 
     pub const fn nonce_len(self) -> usize {
         match self {
-            Algorithm::AES128_GCM => 12,
-            Algorithm::AES256_GCM => 12,
-            Algorithm::ChaCha20_Poly1305 => 12,
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::ChaCha20_Poly1305
+            | Algorithm::OCB3_AES128
+            | Algorithm::OCB3_AES256 => 12,
         }
     }
 }
@@ -142,8 +164,7 @@ impl Open {
     pub const DECRYPT: u32 = 0;
 
     pub fn new(
-        alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>,
-        secret: Vec<u8>,
+        alg: Algorithm, key: &[u8], iv: &[u8], hp_key: &[u8], secret: Vec<u8>,
     ) -> Result<Open> {
         Ok(Open {
             alg,
@@ -172,6 +193,7 @@ impl Open {
         self.alg
     }
 
+    #[inline]
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; HP_MASK_LEN]> {
         if cfg!(feature = "fuzzing") {
             return Ok(<[u8; HP_MASK_LEN]>::default());
@@ -197,6 +219,7 @@ impl Open {
         })
     }
 
+    #[inline]
     pub fn open_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -215,11 +238,39 @@ impl Open {
         self.packet.open_with_u64_counter(counter, ad, buf)
     }
 
+    #[inline]
     pub fn open_with_u64_counter_into(
         &self, counter: u64, ad: &[u8], buf: &[u8], into: &mut [u8],
     ) -> Result<usize> {
         self.packet
             .open_with_u64_counter_into(counter, ad, buf, into)
+    }
+}
+
+/// One plaintext piece of a packet being sealed, described relative to the
+/// destination buffer.
+///
+/// A packet payload is not always contiguous in the sender's buffers: with the
+/// hidden copy zero-copy path the stream frames are encrypted straight from
+/// the application's buffer while the control frames are written in place
+/// inside the packet itself. Describing each piece as either in place or out
+/// of place keeps the destination a single `&mut [u8]` covering the whole
+/// payload, instead of a slice truncated where the pieces meet.
+pub(crate) enum SealPiece<'a> {
+    /// Already at its final offset inside the destination buffer.
+    InPlace { len: usize },
+
+    /// Read from outside the destination buffer.
+    OutOfPlace(&'a [u8]),
+}
+
+impl SealPiece<'_> {
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            SealPiece::InPlace { len } => *len,
+            SealPiece::OutOfPlace(v) => v.len(),
+        }
     }
 }
 
@@ -239,8 +290,7 @@ impl Seal {
     pub(crate) const ENCRYPT: u32 = 1;
 
     pub fn new(
-        alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>,
-        secret: Vec<u8>,
+        alg: Algorithm, key: &[u8], iv: &[u8], hp_key: &[u8], secret: Vec<u8>,
     ) -> Result<Seal> {
         Ok(Seal {
             alg,
@@ -265,6 +315,7 @@ impl Seal {
         })
     }
 
+    #[inline]
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; HP_MASK_LEN]> {
         if cfg!(feature = "fuzzing") {
             return Ok(<[u8; HP_MASK_LEN]>::default());
@@ -294,45 +345,34 @@ impl Seal {
         })
     }
 
+    /// Encrypts `head` followed by `tail` as a single payload, writing the
+    /// ciphertext and the tag at the start of `buf`.
+    #[inline]
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        in_buf: Option<&[u8]>, extra_in: Option<&[u8]>, scatter_crypt: bool,
+        &self, counter: u64, ad: &[u8], buf: &mut [u8], head: SealPiece,
+        tail: SealPiece,
     ) -> Result<usize> {
         if cfg!(feature = "fuzzing") {
-            let tag_len = if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_V1
-            {
-                self.alg.tag_len()
-            } else {
-                let extra_in_len = match extra_in {
-                    Some(v) => v.len(),
-                    None => 0,
-                };
-                self.alg.tag_len() + extra_in_len
-            };
+            let head_len = head.len();
+            let tag_len = self.alg.tag_len();
+            let out_len = head_len + tail.len() + tag_len;
 
-            if let Some(extra) = extra_in {
-                if in_len + tag_len > buf.len() {
-                    return Err(Error::CryptoFail);
-                }
-                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
-                return Ok(in_len + extra.len());
-            }
-            if !scatter_crypt && in_len + tag_len > buf.len() {
+            if out_len > buf.len() {
                 return Err(Error::CryptoFail);
             }
 
-            return Ok(in_len + tag_len);
+            if let SealPiece::OutOfPlace(v) = head {
+                buf[..head_len].copy_from_slice(v);
+            }
+
+            if let SealPiece::OutOfPlace(v) = tail {
+                buf[head_len..out_len - tag_len].copy_from_slice(v);
+            }
+
+            return Ok(out_len);
         }
 
-        self.packet.seal_with_u64_counter(
-            counter,
-            ad,
-            buf,
-            in_len,
-            in_buf,
-            extra_in,
-            scatter_crypt,
-        )
+        self.packet.seal_with_u64_counter(counter, ad, buf, head, tail)
     }
 }
 
@@ -340,11 +380,11 @@ impl HeaderProtectionKey {
     pub fn from_secret(aead: Algorithm, secret: &[u8]) -> Result<Self> {
         let key_len = aead.key_len();
 
-        let mut hp_key = vec![0; key_len];
+        let mut hp_key = [0; MAX_KEY_LEN];
 
-        derive_hdr_key(aead, secret, &mut hp_key)?;
+        derive_hdr_key(aead, secret, &mut hp_key[..key_len])?;
 
-        Self::new(aead, hp_key)
+        Self::new(aead, &hp_key[..key_len])
     }
 }
 
@@ -387,32 +427,56 @@ pub fn derive_initial_key_material(
     }
 
     // Client.
-    let mut client_key = vec![0; key_len];
-    let mut client_iv = vec![0; nonce_len];
-    let mut client_hp_key = vec![0; key_len];
+    let mut client_key = [0; MAX_KEY_LEN];
+    let mut client_iv = [0; MAX_NONCE_LEN];
+    let mut client_hp_key = [0; MAX_KEY_LEN];
 
-    derive_pkt_key(aead, &client_secret, &mut client_key)?;
-    derive_pkt_iv(aead, &client_secret, &mut client_iv)?;
-    derive_hdr_key(aead, &client_secret, &mut client_hp_key)?;
+    derive_pkt_key(aead, &client_secret, &mut client_key[..key_len])?;
+    derive_pkt_iv(aead, &client_secret, &mut client_iv[..nonce_len])?;
+    derive_hdr_key(aead, &client_secret, &mut client_hp_key[..key_len])?;
 
     // Server.
-    let mut server_key = vec![0; key_len];
-    let mut server_iv = vec![0; nonce_len];
-    let mut server_hp_key = vec![0; key_len];
+    let mut server_key = [0; MAX_KEY_LEN];
+    let mut server_iv = [0; MAX_NONCE_LEN];
+    let mut server_hp_key = [0; MAX_KEY_LEN];
 
-    derive_pkt_key(aead, &server_secret, &mut server_key)?;
-    derive_pkt_iv(aead, &server_secret, &mut server_iv)?;
-    derive_hdr_key(aead, &server_secret, &mut server_hp_key)?;
+    derive_pkt_key(aead, &server_secret, &mut server_key[..key_len])?;
+    derive_pkt_iv(aead, &server_secret, &mut server_iv[..nonce_len])?;
+    derive_hdr_key(aead, &server_secret, &mut server_hp_key[..key_len])?;
 
     let (open, seal) = if is_server {
         (
-            Open::new(aead, client_key, client_iv, client_hp_key, client_secret)?,
-            Seal::new(aead, server_key, server_iv, server_hp_key, server_secret)?,
+            Open::new(
+                aead,
+                &client_key[..key_len],
+                &client_iv[..nonce_len],
+                &client_hp_key[..key_len],
+                client_secret,
+            )?,
+            Seal::new(
+                aead,
+                &server_key[..key_len],
+                &server_iv[..nonce_len],
+                &server_hp_key[..key_len],
+                server_secret,
+            )?,
         )
     } else {
         (
-            Open::new(aead, server_key, server_iv, server_hp_key, server_secret)?,
-            Seal::new(aead, client_key, client_iv, client_hp_key, client_secret)?,
+            Open::new(
+                aead,
+                &server_key[..key_len],
+                &server_iv[..nonce_len],
+                &server_hp_key[..key_len],
+                server_secret,
+            )?,
+            Seal::new(
+                aead,
+                &client_key[..key_len],
+                &client_iv[..nonce_len],
+                &client_hp_key[..key_len],
+                client_secret,
+            )?,
         )
     };
 
@@ -514,9 +578,9 @@ fn hkdf_expand_label(
     Ok(())
 }
 
-fn make_nonce(iv: &[u8], counter: u64) -> [u8; MAX_NONCE_LEN] {
-    let mut nonce = [0; MAX_NONCE_LEN];
-    nonce.copy_from_slice(iv);
+#[inline]
+fn make_nonce(iv: &[u8; MAX_NONCE_LEN], counter: u64) -> [u8; MAX_NONCE_LEN] {
+    let mut nonce = *iv;
 
     // XOR the last bytes of the IV with the counter. This is equivalent to
     // left-padding the counter with zero bytes.

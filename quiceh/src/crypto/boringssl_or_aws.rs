@@ -1,7 +1,11 @@
 use super::*;
 
 use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::mem::MaybeUninit;
+
+#[cfg(feature = "ocb3")]
+use ocb3::{AEctx, DecryptIO, EncryptIO, PlainText, Placement};
 
 use libc::c_int;
 use libc::c_uint;
@@ -33,6 +37,9 @@ impl Algorithm {
             Algorithm::ChaCha20_Poly1305 => unsafe {
                 EVP_aead_chacha20_poly1305()
             },
+            Algorithm::OCB3_AES128 | Algorithm::OCB3_AES256 => {
+                unreachable!("OCB3 has no EVP AEAD")
+            },
         }
     }
 }
@@ -61,40 +68,65 @@ fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
     Ok(ctx)
 }
 
+#[allow(clippy::large_enum_variant)]
+enum CipherCtx {
+    Evp(EVP_AEAD_CTX),
+
+    #[cfg(feature = "ocb3")]
+    Ocb3(AEctx),
+}
+
 pub(crate) struct PacketKey {
     alg: Algorithm,
 
-    ctx: EVP_AEAD_CTX,
+    ctx: CipherCtx,
 
-    nonce: Vec<u8>,
+    nonce: [u8; MAX_NONCE_LEN],
 }
 
 impl PacketKey {
     pub fn new(
-        alg: Algorithm, key: Vec<u8>, iv: Vec<u8>, _enc: u32,
+        alg: Algorithm, key: &[u8], iv: &[u8], _enc: u32,
     ) -> Result<Self> {
-        Ok(Self {
-            alg,
-            ctx: make_aead_ctx(alg, &key)?,
-            nonce: iv,
-        })
+        #[cfg(not(feature = "ocb3"))]
+        if matches!(alg, Algorithm::OCB3_AES128 | Algorithm::OCB3_AES256) {
+            log::error!("OCB3 feature is not enabled!");
+            return Err(Error::CryptoFail);
+        }
+
+        let nonce = iv.try_into().map_err(|_| Error::CryptoFail)?;
+
+        let ctx = match alg {
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::ChaCha20_Poly1305 => {
+                CipherCtx::Evp(make_aead_ctx(alg, key)?)
+            },
+            #[cfg(feature = "ocb3")]
+            Algorithm::OCB3_AES128 => CipherCtx::Ocb3(AEctx::new(key)),
+            _ => {
+                log::error!("Unsupported algorithm {:?}", alg);
+                return Err(Error::CryptoFail);
+            },
+        };
+
+        Ok(Self { alg, ctx, nonce })
     }
 
     pub fn from_secret(aead: Algorithm, secret: &[u8], enc: u32) -> Result<Self> {
         let key_len = aead.key_len();
         let nonce_len = aead.nonce_len();
 
-        let mut key = vec![0; key_len];
-        let mut iv = vec![0; nonce_len];
+        let mut key = [0; MAX_KEY_LEN];
+        let mut iv = [0; MAX_NONCE_LEN];
 
-        derive_pkt_key(aead, secret, &mut key)?;
-        derive_pkt_iv(aead, secret, &mut iv)?;
+        derive_pkt_key(aead, secret, &mut key[..key_len])?;
+        derive_pkt_iv(aead, secret, &mut iv[..nonce_len])?;
 
-        let pkt_key = Self::new(aead, key, iv, enc)?;
-
-        Ok(pkt_key)
+        Self::new(aead, &key[..key_len], &iv[..nonce_len], enc)
     }
 
+    #[inline]
     pub fn open_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -109,28 +141,39 @@ impl PacketKey {
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let rc = unsafe {
-            EVP_AEAD_CTX_open(
-                &self.ctx,          // ctx
-                buf.as_mut_ptr(),   // out
-                &mut out_len,       // out_len
-                max_out_len,        // max_out_len
-                nonce[..].as_ptr(), // nonce
-                nonce.len(),        // nonce_len
-                buf.as_ptr(),       // inp
-                buf.len(),          // in_len
-                ad.as_ptr(),        // ad
-                ad.len(),           // ad_len
-            )
-        };
+        match &self.ctx {
+            CipherCtx::Evp(ctx) => {
+                let rc = unsafe {
+                    EVP_AEAD_CTX_open(
+                        ctx,                // ctx
+                        buf.as_mut_ptr(),   // out
+                        &mut out_len,       // out_len
+                        max_out_len,        // max_out_len
+                        nonce[..].as_ptr(), // nonce
+                        nonce.len(),        // nonce_len
+                        buf.as_ptr(),       // inp
+                        buf.len(),          // in_len
+                        ad.as_ptr(),        // ad
+                        ad.len(),           // ad_len
+                    )
+                };
 
-        if rc != 1 {
-            return Err(Error::CryptoFail);
+                if rc != 1 {
+                    return Err(Error::CryptoFail);
+                }
+
+                Ok(out_len)
+            },
+            #[cfg(feature = "ocb3")]
+            CipherCtx::Ocb3(ctx) => {
+                ctx.ae_decrypt(DecryptIO::InPlace(buf), &nonce, ad)
+                    .map_err(|_| Error::CryptoFail)?;
+                Ok(out_len)
+            },
         }
-
-        Ok(out_len)
     }
 
+    #[inline]
     pub fn open_with_u64_counter_into(
         &self, counter: u64, ad: &[u8], buf: &[u8], into: &mut [u8],
     ) -> Result<usize> {
@@ -151,105 +194,182 @@ impl PacketKey {
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let rc = unsafe {
-            EVP_AEAD_CTX_open(
-                &self.ctx,          // ctx
-                into.as_mut_ptr(),  // out
-                &mut out_len,       // out_len
-                max_out_len,        // max_out_len
-                nonce[..].as_ptr(), // nonce
-                nonce.len(),        // nonce_len
-                buf.as_ptr(),       // inp
-                buf.len(),          // in_len
-                ad.as_ptr(),        // ad
-                ad.len(),           // ad_len
-            )
-        };
+        match &self.ctx {
+            CipherCtx::Evp(ctx) => {
+                let rc = unsafe {
+                    EVP_AEAD_CTX_open(
+                        ctx,                // ctx
+                        into.as_mut_ptr(),  // out
+                        &mut out_len,       // out_len
+                        max_out_len,        // max_out_len
+                        nonce[..].as_ptr(), // nonce
+                        nonce.len(),        // nonce_len
+                        buf.as_ptr(),       // inp
+                        buf.len(),          // in_len
+                        ad.as_ptr(),        // ad
+                        ad.len(),           // ad_len
+                    )
+                };
 
-        if rc != 1 {
-            return Err(Error::CryptoFail);
+                if rc != 1 {
+                    return Err(Error::CryptoFail);
+                }
+
+                Ok(out_len)
+            },
+            #[cfg(feature = "ocb3")]
+            CipherCtx::Ocb3(ctx) => {
+                ctx.ae_decrypt(
+                    DecryptIO::OutOfPlace {
+                        in_ct: buf,
+                        out_pt: into,
+                    },
+                    &nonce,
+                    ad,
+                )
+                .map_err(|_| Error::CryptoFail)?;
+                Ok(out_len)
+            },
         }
-
-        Ok(out_len)
     }
 
+    #[inline]
     pub fn seal_with_u64_counter(
-        &self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
-        in_buf: Option<&[u8]>, extra_in: Option<&[u8]>, scatter_crypt: bool,
+        &self, counter: u64, ad: &[u8], buf: &mut [u8], head: SealPiece,
+        tail: SealPiece,
     ) -> Result<usize> {
-        if cfg!(feature = "fuzzing") {
-            if let Some(extra) = extra_in {
-                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
-                return Ok(in_len + extra.len());
-            }
-
-            return Ok(in_len);
-        }
-
+        let head_len = head.len();
+        let tail_len = tail.len();
         let tag_len = self.alg.tag_len();
 
-        // So: if we use hidden_copy
-        //
-        // buf is the desitination buffer whose length
-        // ends at the payload offset.
-        //
-        // If REVERSO:
-        //  in_buf is the stream_frame of in_buf.len() bytes
-        //  extra_in is pointing to buf at payload_offset+stream_len.
-        //  remaining length should hold extra_in_len + tag_len
-        //
-        // if V1:
-        //  in_buf is the ctrl data which is contained inside buf at position
-        // payload_offset  this is expected to be written in buf at the
-        // same position.  the length of in_buf should be able to hold
-        // ctrl_len, stream_len and tag_len  extra_in contains the
-        // stream_frame of stream_len bytes.
-        //
-        let (extra_in_ptr, extra_in_len) = match extra_in {
-            Some(v) => (v.as_ptr(), v.len()),
-            None => (std::ptr::null(), 0),
-        };
+        if cfg!(feature = "fuzzing") {
+            if let SealPiece::OutOfPlace(v) = head {
+                buf[..head_len].copy_from_slice(v);
+            }
 
-        let mut out_tag_len = tag_len + extra_in_len;
+            if let SealPiece::OutOfPlace(v) = tail {
+                buf[head_len..head_len + tail_len].copy_from_slice(v);
+            }
 
-        // Make sure it fits in the buffer.
-        if !scatter_crypt && in_len + tag_len > buf.len() {
+            return Ok(head_len + tail_len);
+        }
+
+        // The destination covers the whole payload followed by the tag,
+        // whichever AEAD ends up writing it.
+        if head_len + tail_len + tag_len > buf.len() {
             debug!("Buffer too small");
             return Err(Error::CryptoFail);
         }
 
         let nonce = make_nonce(&self.nonce, counter);
 
-        let in_ptr = if let Some(in_buf) = in_buf {
-            in_buf.as_ptr()
-        } else {
-            buf.as_ptr()
-        };
+        match &self.ctx {
+            CipherCtx::Evp(ctx) => {
+                let mut out_tag_len = tag_len + tail_len;
 
-        let rc = unsafe {
-            let out_tag_mut_ptr = buf.as_mut_ptr().add(in_len);
-            EVP_AEAD_CTX_seal_scatter(
-                &self.ctx,              // ctx
-                buf.as_mut_ptr(),       // out
-                out_tag_mut_ptr,        // out_tag
-                &mut out_tag_len,       // out_tag_len
-                tag_len + extra_in_len, // max_out_tag_len
-                nonce[..].as_ptr(),     // nonce
-                nonce.len(),            // nonce_len
-                in_ptr,                 // inp
-                in_len,                 // in_len
-                extra_in_ptr,           // extra_in
-                extra_in_len,           // extra_in_len
-                ad.as_ptr(),            // ad
-                ad.len(),               // ad_len
-            )
-        };
-        if rc != 1 {
-            debug!("seal_scatter returned -1");
-            return Err(Error::CryptoFail);
+                // EVP_AEAD_CTX_seal_scatter encrypts inp into out and
+                // extra_in into out_tag, so an in-place piece is simply
+                // read back from the destination at its own offset.
+                let (in_ptr, extra_in_ptr) = unsafe {
+                    let dst = buf.as_mut_ptr();
+
+                    let in_ptr = match head {
+                        SealPiece::OutOfPlace(v) => v.as_ptr(),
+                        SealPiece::InPlace { .. } => dst,
+                    };
+
+                    let extra_in_ptr = if tail_len == 0 {
+                        std::ptr::null()
+                    } else {
+                        match tail {
+                            SealPiece::OutOfPlace(v) => v.as_ptr(),
+                            SealPiece::InPlace { .. } => dst.add(head_len),
+                        }
+                    };
+
+                    (in_ptr, extra_in_ptr)
+                };
+
+                let rc = unsafe {
+                    let out_tag_mut_ptr = buf.as_mut_ptr().add(head_len);
+                    EVP_AEAD_CTX_seal_scatter(
+                        ctx,                // ctx
+                        buf.as_mut_ptr(),   // out
+                        out_tag_mut_ptr,    // out_tag
+                        &mut out_tag_len,   // out_tag_len
+                        tag_len + tail_len, // max_out_tag_len
+                        nonce[..].as_ptr(), // nonce
+                        nonce.len(),        // nonce_len
+                        in_ptr,             // inp
+                        head_len,           // in_len
+                        extra_in_ptr,       // extra_in
+                        tail_len,           // extra_in_len
+                        ad.as_ptr(),        // ad
+                        ad.len(),           // ad_len
+                    )
+                };
+                if rc != 1 {
+                    debug!("seal_scatter returned -1");
+                    return Err(Error::CryptoFail);
+                }
+
+                Ok(head_len + out_tag_len)
+            },
+            #[cfg(feature = "ocb3")]
+            CipherCtx::Ocb3(ctx) => {
+                // ocb3 sizes the plaintext from the slices it is handed and
+                // bounds the destination against `out.len()`, so it is given
+                // exactly the payload followed by the tag slot.
+                let payload = &mut buf[..head_len + tail_len + tag_len];
+
+                let io = match (head, tail) {
+                    (SealPiece::OutOfPlace(h), SealPiece::OutOfPlace(t))
+                        if !h.is_empty() && !t.is_empty() =>
+                    {
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Scattered(h, t),
+                            out: payload,
+                        }
+                    },
+                    (SealPiece::OutOfPlace(h), SealPiece::InPlace { len })
+                        if !h.is_empty() && len > 0 =>
+                    {
+                        EncryptIO::MixedPlace {
+                            out: payload,
+                            part: h,
+                            at: Placement::Head,
+                        }
+                    },
+                    (SealPiece::InPlace { len }, SealPiece::OutOfPlace(t))
+                        if len > 0 && !t.is_empty() =>
+                    {
+                        EncryptIO::MixedPlace {
+                            out: payload,
+                            part: t,
+                            at: Placement::Tail,
+                        }
+                    },
+                    (SealPiece::OutOfPlace(h), _) if !h.is_empty() => {
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Contiguous(h),
+                            out: payload,
+                        }
+                    },
+                    (_, SealPiece::OutOfPlace(t)) if !t.is_empty() => {
+                        EncryptIO::OutOfPlace {
+                            in_pt: PlainText::Contiguous(t),
+                            out: payload,
+                        }
+                    },
+                    _ => EncryptIO::InPlace(payload),
+                };
+
+                ctx.ae_encrypt(io, &nonce, ad)
+                    .map_err(|_| Error::CryptoFail)?;
+
+                Ok(head_len + tail_len + tag_len)
+            },
         }
-
-        Ok(in_len + out_tag_len)
     }
 }
 
@@ -258,13 +378,15 @@ impl PacketKey {
 pub(crate) enum HeaderProtectionKey {
     Aes(AES_KEY),
 
-    ChaCha(Vec<u8>),
+    ChaCha([u8; MAX_KEY_LEN]),
 }
 
 impl HeaderProtectionKey {
-    pub fn new(alg: Algorithm, hp_key: Vec<u8>) -> Result<Self> {
+    pub fn new(alg: Algorithm, hp_key: &[u8]) -> Result<Self> {
         match alg {
-            Algorithm::AES128_GCM | Algorithm::AES256_GCM => unsafe {
+            Algorithm::AES128_GCM
+            | Algorithm::AES256_GCM
+            | Algorithm::OCB3_AES128 => unsafe {
                 let key_len_bits = alg.key_len() as u32 * 8;
 
                 let mut aes_key = MaybeUninit::<AES_KEY>::uninit();
@@ -283,10 +405,19 @@ impl HeaderProtectionKey {
                 Ok(Self::Aes(aes_key))
             },
 
-            Algorithm::ChaCha20_Poly1305 => Ok(Self::ChaCha(hp_key)),
+            Algorithm::OCB3_AES256 => {
+                log::error!("AES256 is not supported for our OCB3 provider");
+                Err(Error::CryptoFail)
+            },
+
+            Algorithm::ChaCha20_Poly1305 => {
+                let key = hp_key.try_into().map_err(|_| Error::CryptoFail)?;
+                Ok(Self::ChaCha(key))
+            },
         }
     }
 
+    #[inline]
     pub fn new_mask(&self, sample: &[u8]) -> Result<HeaderProtectionMask> {
         match self {
             Self::Aes(aes_key) => {

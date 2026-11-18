@@ -84,7 +84,7 @@ struct SSL_PRIVATE_KEY_METHOD {
     >,
 }
 
-pub(super) static QUICHE_STREAM_METHOD: SSL_QUIC_METHOD = SSL_QUIC_METHOD {
+pub(super) static QUICEH_STREAM_METHOD: SSL_QUIC_METHOD = SSL_QUIC_METHOD {
     set_read_secret: Some(set_read_secret),
     set_write_secret: Some(set_write_secret),
     add_handshake_data: Some(add_handshake_data),
@@ -256,7 +256,7 @@ impl Handshake {
             ssl_private_key_result_t::ssl_private_key_failure
         }
 
-        static QUICHE_PRIVATE_KEY_METHOD: SSL_PRIVATE_KEY_METHOD =
+        static QUICEH_PRIVATE_KEY_METHOD: SSL_PRIVATE_KEY_METHOD =
             SSL_PRIVATE_KEY_METHOD {
                 decrypt: Some(failing_decrypt),
                 sign: Some(failing_sign),
@@ -266,7 +266,7 @@ impl Handshake {
         unsafe {
             SSL_set_private_key_method(
                 self.as_mut_ptr(),
-                &QUICHE_PRIVATE_KEY_METHOD,
+                &QUICEH_PRIVATE_KEY_METHOD,
             );
         }
     }

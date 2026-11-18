@@ -855,6 +855,7 @@ pub fn decode_pkt_offset(
     decode_pkt_num(largest_offset, truncated_offset, offset_len)
 }
 
+#[inline]
 pub fn decrypt_pkt_v3<'a>(
     b: &'a mut octets_rev::OctetsMut, pn: u64, hdr_enc_len: usize,
     payload_len: usize, outbuf: Option<&'a mut [u8]>, aead: &crypto::Open,
@@ -890,6 +891,7 @@ pub fn decrypt_pkt_v3<'a>(
     }
 }
 
+#[inline]
 pub fn decrypt_pkt<'a>(
     b: &'a mut octets_rev::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     aead: &crypto::Open,
@@ -982,10 +984,10 @@ pub fn encrypt_hdr(
     encrypt_hdr_inner(first, rest, enc_len, payload, aead, version)
 }
 
+#[inline]
 pub fn encrypt_pkt(
-    b: &mut octets_rev::OctetsMut, inbuf: Option<&[u8]>, pn: u64,
-    payload_len: usize, payload_offset: usize, extra_in: Option<&[u8]>,
-    aead: &crypto::Seal, scatter_crypt: bool,
+    b: &mut octets_rev::OctetsMut, pn: u64, payload_offset: usize,
+    head: crypto::SealPiece, tail: crypto::SealPiece, aead: &crypto::Seal,
 ) -> Result<usize> {
     let (header, mut payload) = b.split_at(payload_offset)?;
 
@@ -993,10 +995,8 @@ pub fn encrypt_pkt(
         pn,
         header.as_ref(),
         payload.as_mut(),
-        payload_len,
-        inbuf,
-        extra_in,
-        scatter_crypt,
+        head,
+        tail,
     )?;
 
     // encrypt_hdr(&mut header, hdr_enc_len, payload.as_ref(), aead, version)?;
@@ -1180,8 +1180,8 @@ fn compute_retry_integrity_tag(
 
     let key = crypto::PacketKey::new(
         RETRY_AEAD_ALG,
-        key.to_vec(),
-        nonce.to_vec(),
+        key,
+        &nonce,
         crypto::Seal::ENCRYPT,
     )?;
 
@@ -1191,10 +1191,8 @@ fn compute_retry_integrity_tag(
         0,
         &pseudo,
         &mut out_tag,
-        0,
-        None,
-        None,
-        false,
+        crypto::SealPiece::InPlace { len: 0 },
+        crypto::SealPiece::InPlace { len: 0 },
     )?;
 
     // Ensure that the output only contains the AEAD tag.
@@ -2032,13 +2030,11 @@ mod tests {
 
         let written = encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             &aead,
-            false,
         )
         .unwrap();
         let (mut header, payload) = b.split_at(payload_offset).unwrap();
@@ -2381,13 +2377,11 @@ mod tests {
 
         let written = encrypt_pkt(
             &mut b,
-            None,
             pn,
-            payload_len,
             payload_offset,
-            None,
+            crypto::SealPiece::InPlace { len: payload_len },
+            crypto::SealPiece::InPlace { len: 0 },
             &aead,
-            false,
         )
         .unwrap();
 
