@@ -11992,6 +11992,168 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn ocb3_hidden_copy_zc() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_hidden_copy_for_zc_sender(true);
+        config.verify_peer(false);
+        config.set_use_ocb3(true);
+
+        let mut pipe = Pipe::<BufTestFactory>::with_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let app_server = &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+        assert!(matches!(
+            app_server.crypto_open.as_ref().unwrap().alg(),
+            crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+        ));
+
+        assert_eq!(pipe.client.stream_send(8, b"hello, world", false), Ok(12));
+        assert_eq!(
+            pipe.client.stream_send_zc(
+                8,
+                BufTestFactory::buf_from_slice(b"ciao, world"),
+                Some(11),
+                true,
+            ),
+            Ok((11, None))
+        );
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
+            assert_eq!(b, b"hello, worldciao, world");
+            assert_eq!((len, fin), (23, true));
+            assert!(pipe.server.stream_consumed(8, len).is_ok());
+        } else {
+            let mut buf = [0; 32];
+            assert_eq!(pipe.server.stream_recv(8, &mut buf), Ok((23, true)));
+            assert_eq!(&buf[..23], b"hello, worldciao, world");
+        }
+    }
+
+    #[cfg(feature = "ocb3")]
+    #[test]
+    fn ocb3_chunk_boundary_out_of_place_decrypt() {
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
+            let mut buf = [0; 65535];
+            let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+            config
+                .load_cert_chain_from_pem_file("examples/cert.crt")
+                .unwrap();
+            config
+                .load_priv_key_from_pem_file("examples/cert.key")
+                .unwrap();
+            config
+                .set_application_protos(&[b"proto1", b"proto2"])
+                .unwrap();
+            config.set_initial_max_data(10 * 32 * 1024);
+            config.set_initial_max_streams_bidi(3);
+            config.set_initial_max_stream_data_bidi_local(10 * 32 * 1024);
+            config.set_initial_max_stream_data_bidi_remote(10 * 32 * 1024);
+            config.set_expected_chunklen_to_consume(PAYLOAD_MIN_LEN_WITH_TAG);
+            config.verify_peer(false);
+            config.set_use_ocb3(true);
+
+            let mut pipe = <Pipe>::with_config(&config).unwrap();
+            assert_eq!(pipe.handshake(), Ok(()));
+
+            let app_server =
+                &pipe.server.pkt_num_spaces[packet::Epoch::Application];
+            assert!(matches!(
+                app_server.crypto_open.as_ref().unwrap().alg(),
+                crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
+            ));
+
+            let frames = [
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(b"aaaaaaaaaaaa", 0, false),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(b"bbbbbbbbbbbbb", 12, false),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(
+                        b"bbbbbbbbbbbbbbbbbbbbbbbbb",
+                        25,
+                        false,
+                    ),
+                },
+                frame::Frame::Stream {
+                    stream_id: 4,
+                    data: <RangeBuf>::from(
+                        b"cccccccccccccccccccccccccccccccc",
+                        50,
+                        true,
+                    ),
+                },
+            ];
+
+            let pkt_type = packet::Type::Short;
+
+            // Send first 12 bytes at offset 0 (partial chunk).
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[0].clone()], &mut buf)
+                .is_ok());
+
+            let (_, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (12, false));
+
+            // Fill the rest of the 25-byte chunk with 13 bytes at offset 12.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[1].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"aaaaaaaaaaaabbbbbbbbbbbbb");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            // Send an exact 25-byte chunk at offset 25.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[2].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"bbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            // Send 32 bytes at offset 50, spilling across chunk boundaries.
+            assert!(pipe
+                .send_pkt_to_server(pkt_type, &[frames[3].clone()], &mut buf)
+                .is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (25, false));
+            assert_eq!(&b[..], b"ccccccccccccccccccccccccc");
+            assert!(pipe.server.stream_consumed(4, 25).is_ok());
+
+            let (b, len, is_fin) = pipe.server.stream_peek(4).unwrap();
+            assert_eq!((len, is_fin), (7, true));
+            assert_eq!(&b[..], b"ccccccc");
+            assert!(pipe.server.stream_consumed(4, 7).is_ok());
+        }
+    }
+
     #[test]
     fn handshake_alpn_mismatch() {
         let mut buf = [0; 65535];
