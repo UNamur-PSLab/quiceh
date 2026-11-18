@@ -5752,77 +5752,48 @@ impl<F: BufFactory> Connection<F> {
         };
 
         let written = if self.use_hidden_crypt_copy_for_zc {
-            let sentry = if self.version == crate::PROTOCOL_VERSION_VREVERSO {
-                if let Some(frame::Frame::StreamHeader { stream_id, .. }) =
-                    frames.first()
-                {
-                    Some(self.streams.entry(*stream_id))
-                } else {
-                    None
-                }
-            } else if self.version == crate::PROTOCOL_VERSION_V1 {
-                if let Some(frame::Frame::StreamHeader { stream_id, .. }) =
-                    &maybe_stream_header
-                {
-                    Some(self.streams.entry(*stream_id))
-                } else {
-                    None
-                }
-            } else {
-                None
+            let stream_id = match &maybe_stream_header {
+                Some(frame::Frame::StreamHeader { stream_id, .. }) => {
+                    Some(*stream_id)
+                },
+                _ => None,
             };
 
-            let written = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
-                // The stream frames are encrypted straight from the rangebuf
-                // and the control frames are already in place behind them,
-                // starting with the reversed stream frame.
-                let rangebuf = sentry.as_ref().and_then(|v| match v {
-                    std::collections::hash_map::Entry::Occupied(v) => {
-                        v.get().send.rangebuf_get().map(|rb| &rb[..b_len])
-                    },
-                    _ => None,
-                });
-
-                let head = match rangebuf {
-                    Some(v) => crypto::SealPiece::OutOfPlace(v),
-                    None => crypto::SealPiece::InPlace { len: b_len },
-                };
-
-                packet::encrypt_pkt(
-                    &mut b_start,
-                    pn,
-                    payload_offset,
-                    head,
-                    crypto::SealPiece::InPlace { len: b_ctrl_len },
-                    aead,
-                )?
-            } else {
-                let rangebuf = sentry.as_ref().and_then(|v| match v {
-                    std::collections::hash_map::Entry::Occupied(v) => {
-                        v.get().send.rangebuf_get().map(|rb| &rb[..b_len])
-                    },
-                    _ => None,
-                });
-                // In V1 the control frames come first, written in place at the
-                // head of the payload, and the stream frames follow from the
-                // rangebuf, with the stream header at the end of the ctrl.
-                let tail = match rangebuf {
-                    Some(v) => crypto::SealPiece::OutOfPlace(v),
-                    None => crypto::SealPiece::InPlace { len: 0 },
-                };
-
-                packet::encrypt_pkt(
-                    &mut b_start,
-                    pn,
-                    payload_offset,
-                    crypto::SealPiece::InPlace { len: b_ctrl_len },
-                    tail,
-                    aead,
-                )?
+            let rangebuf = match stream_id {
+                Some(sid) => self
+                    .streams
+                    .get(sid)
+                    .and_then(|s| s.send.rangebuf_get())
+                    .map(|rb| &rb[..b_len]),
+                None => None,
             };
+
+            let stream_piece = match rangebuf {
+                Some(v) => crypto::SealPiece::OutOfPlace(v),
+                None => crypto::SealPiece::InPlace { len: b_len },
+            };
+            let ctrl_piece = crypto::SealPiece::InPlace { len: b_ctrl_len };
+
+            // In VReverso, stream frames come first and control frames sit in
+            // place behind them. In V1, control frames (ending with the stream
+            // header) come first and stream frames follow from the rangebuf.
+            let (head, tail) = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
+                (stream_piece, ctrl_piece)
+            } else {
+                (ctrl_piece, stream_piece)
+            };
+
+            let written = packet::encrypt_pkt(
+                &mut b_start,
+                pn,
+                payload_offset,
+                head,
+                tail,
+                aead,
+            )?;
 
             // Update the stream's send buffer and flushable status.
-            if let Some(sid) = sentry.as_ref().map(|e| *e.key()) {
+            if let Some(sid) = stream_id {
                 self.streams.on_stream_data_sent(sid, b_len).ok();
             }
 
@@ -9972,6 +9943,8 @@ impl Default for TransportParams {
 }
 
 impl TransportParams {
+    const TP_USE_OCB3: u64 = 0xff71;
+
     pub(crate) fn has_use_ocb3(buf: &[u8]) -> bool {
         let mut params = octets_rev::Octets::with_slice(buf);
 
@@ -9980,12 +9953,12 @@ impl TransportParams {
                 return false;
             };
 
-            if params.get_bytes_with_varint_length().is_err() {
+            let Ok(val) = params.get_bytes_with_varint_length() else {
                 return false;
-            }
+            };
 
-            if id == 0xff71 {
-                return true;
+            if id == Self::TP_USE_OCB3 {
+                return val.cap() == 0;
             }
         }
 
@@ -10137,7 +10110,12 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
                 
-                0xff71=> {
+                // Used elsewhere too, so a const is defined in the module.
+                Self::TP_USE_OCB3 => {
+                    if val.cap() != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
                     tp.use_ocb3 = true;
                 },
 
@@ -10304,7 +10282,7 @@ impl TransportParams {
         }
         
         if tp.use_ocb3 {
-            TransportParams::encode_param(&mut b, 0xff71, 0)?;
+            TransportParams::encode_param(&mut b, Self::TP_USE_OCB3, 0)?;
         }
 
         let out_len = b.off();
@@ -11287,7 +11265,6 @@ mod tests {
 
         let encoded =
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
-        println!("{:?}", encoded);
         assert!(encoded.ends_with(&[0xff, 0x71, 0x00]));
 
         let new_tp = TransportParams::decode(encoded, false).unwrap();
@@ -20117,6 +20094,7 @@ mod tests {
 
         let mut pipe = <Pipe>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
 
         let scid = pipe.client.source_id().into_owned();
 
@@ -20135,6 +20113,12 @@ mod tests {
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
 
+        if let Some(timer) = pipe.client.timeout() {
+            std::thread::sleep(timer + time::Duration::from_millis(1));
+            pipe.client.on_timeout();
+            assert_eq!(pipe.advance(), Ok(()));
+        }
+
         // At this point, the server should be notified that it has a new CID.
         assert_eq!(pipe.server.available_dcids(), 1);
 
@@ -20152,6 +20136,12 @@ mod tests {
 
         // Let exchange packets over the connection.
         assert_eq!(pipe.advance(), Ok(()));
+
+        if let Some(timer) = pipe.server.timeout() {
+            std::thread::sleep(timer + time::Duration::from_millis(1));
+            pipe.server.on_timeout();
+            assert_eq!(pipe.advance(), Ok(()));
+        }
 
         assert_eq!(pipe.client.retired_scid_next(), Some(scid));
         assert_eq!(pipe.client.retired_scid_next(), None);
