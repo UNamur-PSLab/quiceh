@@ -5107,6 +5107,8 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        let mut zc_stream_payload = None;
+
         // Create a single STREAM frame for the first stream that is flushable.
         let maybe_stream_header = if (pkt_type == packet::Type::Short
             || pkt_type == packet::Type::ZeroRTT)
@@ -5142,6 +5144,7 @@ impl<F: BufFactory> Connection<F> {
 
                 let stream_off = stream.send.off_front();
                 let largest_contiguous_off_acked = stream.send.ack_off();
+
                 trace!(
                     "stream_off: {}, Largest_contiguous_off_acked:{}",
                     stream_off,
@@ -5226,82 +5229,82 @@ impl<F: BufFactory> Connection<F> {
                     },
                 };
 
-                let (len, fin) = if self.use_hidden_crypt_copy_for_zc {
-                    // We'll copy the stream data while encrypting. If the stream
-                    // data is fragmented in smaller sizes than the max payload
-                    // len this method would yield more
-                    // packets.
-                    stream.send.rangebuf_len(max_len)?
+                let zc_res = if self.use_hidden_crypt_copy_for_zc {
+                    stream.send.try_emit_zc(max_len)?
+                } else {
+                    None
+                };
+
+                let (len, fin) = if let Some((len, fin, pos, old_pos)) = zc_res {
+                    trace!("Emitting in zero-copy {len} bytes at pos {pos}");
+                    zc_stream_payload = Some((stream_id, pos, old_pos, len));
+                    (len, fin)
                 } else {
                     // We copy the data directly into the buffer. Encryption will
                     // be inplace.
-                    let (len, fin) =
-                        if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
-                            // Write stream data into the packet buffer; normally
-                            // right after
-                            // the encrypted header.
-                            let (len, fin) =
-                                stream.send.emit(&mut b.as_mut()[..max_len])?;
-                            // Advance the buffer
-                            b.skip(len + hdr_len)?;
+                    if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
+                        // Write stream data into the packet buffer; normally
+                        // right after
+                        // the encrypted header.
+                        let (len, fin) =
+                            stream.send.emit(&mut b.as_mut()[..max_len])?;
+                        // Advance the buffer
+                        b.skip(len + hdr_len)?;
 
-                            let mut rev_b = OctetsMutRev::from(b);
+                        let mut rev_b = OctetsMutRev::from(b);
 
-                            // Encode the header reversed
-                            frame::encode_stream_header(
-                                stream_id, stream_off, len as u64, fin,
-                                &mut rev_b,
-                            )?;
+                        // Encode the header reversed
+                        frame::encode_stream_header(
+                            stream_id, stream_off, len as u64, fin, &mut rev_b,
+                        )?;
 
-                            b = OctetsMut::from(rev_b);
+                        b = OctetsMut::from(rev_b);
 
-                            // back to the initial index.
-                            b.rewind(len)?;
+                        // back to the initial index.
+                        b.rewind(len)?;
 
-                            (len, fin)
-                        } else {
-                            let (mut stream_hdr, mut stream_payload) =
-                                b.split_at(hdr_off + hdr_len)?;
+                        (len, fin)
+                    } else {
+                        let (mut stream_hdr, mut stream_payload) =
+                            b.split_at(hdr_off + hdr_len)?;
 
-                            // Write stream data into the packet buffer.
-                            let (len, fin) = stream
-                                .send
-                                .emit(&mut stream_payload.as_mut()[..max_len])?;
+                        // Write stream data into the packet buffer.
+                        let (len, fin) = stream
+                            .send
+                            .emit(&mut stream_payload.as_mut()[..max_len])?;
 
-                            // Encode the frame's header.
-                            //
-                            // Due to how `OctetsMut::split_at()` works,
-                            // `stream_hdr` starts
-                            // from the initial offset of `b` (rather than the
-                            // current offset), so it
-                            // needs to be advanced to the initial frame
-                            // offset.
-                            stream_hdr.skip(hdr_off)?;
+                        // Encode the frame's header.
+                        //
+                        // Due to how `OctetsMut::split_at()` works,
+                        // `stream_hdr` starts
+                        // from the initial offset of `b` (rather than the
+                        // current offset), so it
+                        // needs to be advanced to the initial frame
+                        // offset.
+                        stream_hdr.skip(hdr_off)?;
 
-                            frame::encode_stream_header(
-                                stream_id,
-                                stream_off,
-                                len as u64,
-                                fin,
-                                &mut stream_hdr,
-                            )?;
+                        frame::encode_stream_header(
+                            stream_id,
+                            stream_off,
+                            len as u64,
+                            fin,
+                            &mut stream_hdr,
+                        )?;
 
-                            (len, fin)
-                        };
-
-                    // If the stream is no longer flushable, remove it from the
-                    // queue
-                    if !stream.is_flushable() {
-                        self.streams.remove_flushable(&priority_key);
-                    } else if stream.incremental {
-                        // Shuffle the incremental stream to the back of the
-                        // queue.
-                        self.streams.remove_flushable(&priority_key);
-                        self.streams.insert_flushable(&priority_key);
+                        (len, fin)
                     }
-
-                    (len, fin)
                 };
+
+                // If the stream is no longer flushable, remove it from the
+                // queue
+                if !stream.is_flushable() {
+                    self.streams.remove_flushable(&priority_key);
+                } else if stream.incremental {
+                    // Shuffle the incremental stream to the back of the
+                    // queue.
+                    self.streams.remove_flushable(&priority_key);
+                    self.streams.insert_flushable(&priority_key);
+                }
 
                 let frame = frame::Frame::StreamHeader {
                     stream_id,
@@ -5323,7 +5326,7 @@ impl<F: BufFactory> Connection<F> {
                     cumul += wire_len;
                 } else {
                     let wire_len = frame.wire_len();
-                    if self.use_hidden_crypt_copy_for_zc {
+                    if zc_stream_payload.is_some() {
                         maybe_frame = frame;
                         left -= wire_len;
                         cumul += wire_len;
@@ -5583,9 +5586,7 @@ impl<F: BufFactory> Connection<F> {
         // stream frames come from the rangebuf when there is one, and the
         // `b_ctrl_len` bytes of control frames are already in place inside the
         // destination.
-        let (mut b_start, b_len, b_ctrl_len) = if self
-            .use_hidden_crypt_copy_for_zc
-        {
+        let (mut b_start, b_len, b_ctrl_len) = if zc_stream_payload.is_some() {
             // If we're in VReverso, the frame should be first.
             if self.version == crate::PROTOCOL_VERSION_VREVERSO {
                 let stream_len =
@@ -5612,7 +5613,13 @@ impl<F: BufFactory> Connection<F> {
                     );
                     b_ctrl.skip(ctrl_len)?;
                     let mut b_ctrl_rev = OctetsMutRev::from(b_ctrl);
-                    push_frames_to_pkt!(b_ctrl_rev, frames, true, self.version, true);
+                    push_frames_to_pkt!(
+                        b_ctrl_rev,
+                        frames,
+                        true,
+                        self.version,
+                        true
+                    );
                     trace!("b_ctrl off at {}", b_ctrl_rev.off());
                 }
 
@@ -5647,7 +5654,13 @@ impl<F: BufFactory> Connection<F> {
 
                 {
                     let (_, mut b_ctrl) = b.split_at(payload_offset)?;
-                    push_frames_to_pkt!(b_ctrl, frames, true, self.version, false);
+                    push_frames_to_pkt!(
+                        b_ctrl,
+                        frames,
+                        true,
+                        self.version,
+                        false
+                    );
                     ctrl_len = b_ctrl.off();
                 }
 
@@ -5751,53 +5764,35 @@ impl<F: BufFactory> Connection<F> {
             None => return Err(Error::InvalidState),
         };
 
-        let written = if self.use_hidden_crypt_copy_for_zc {
-            let stream_id = match &maybe_stream_header {
-                Some(frame::Frame::StreamHeader { stream_id, .. }) => {
-                    Some(*stream_id)
-                },
-                _ => None,
-            };
+        let written = if let Some((sid, pos, old_pos, zc_len)) = zc_stream_payload
+        {
+            let zc_slice = self
+                .streams
+                .get(sid)
+                .map(|s| s.send.get_zc_slice(pos, old_pos, zc_len))
+                .ok_or(Error::InvalidState)?;
 
-            let rangebuf = match stream_id {
-                Some(sid) => self
-                    .streams
-                    .get(sid)
-                    .and_then(|s| s.send.rangebuf_get())
-                    .map(|rb| &rb[..b_len]),
-                None => None,
-            };
-
-            let stream_piece = match rangebuf {
-                Some(v) => crypto::SealPiece::OutOfPlace(v),
-                None => crypto::SealPiece::InPlace { len: b_len },
-            };
+            let stream_piece = crypto::SealPiece::OutOfPlace(zc_slice);
             let ctrl_piece = crypto::SealPiece::InPlace { len: b_ctrl_len };
 
             // In VReverso, stream frames come first and control frames sit in
             // place behind them. In V1, control frames (ending with the stream
             // header) come first and stream frames follow from the rangebuf.
-            let (head, tail) = if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
-                (stream_piece, ctrl_piece)
-            } else {
-                (ctrl_piece, stream_piece)
-            };
+            let (head, tail) =
+                if likely(self.version == PROTOCOL_VERSION_VREVERSO) {
+                    (stream_piece, ctrl_piece)
+                } else {
+                    (ctrl_piece, stream_piece)
+                };
 
-            let written = packet::encrypt_pkt(
+            packet::encrypt_pkt(
                 &mut b_start,
                 pn,
                 payload_offset,
                 head,
                 tail,
                 aead,
-            )?;
-
-            // Update the stream's send buffer and flushable status.
-            if let Some(sid) = stream_id {
-                self.streams.on_stream_data_sent(sid, b_len).ok();
-            }
-
-            written
+            )?
         } else {
             packet::encrypt_pkt(
                 &mut b_start,
@@ -10109,7 +10104,7 @@ impl TransportParams {
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
-                
+
                 // Used elsewhere too, so a const is defined in the module.
                 Self::TP_USE_OCB3 => {
                     if val.cap() != 0 {
@@ -10280,7 +10275,7 @@ impl TransportParams {
             )?;
             b.put_varint(max_datagram_frame_size)?;
         }
-        
+
         if tp.use_ocb3 {
             TransportParams::encode_param(&mut b, Self::TP_USE_OCB3, 0)?;
         }
@@ -11844,7 +11839,7 @@ mod tests {
             app_server.crypto_open.as_ref().unwrap().alg(),
             crypto::Algorithm::OCB3_AES128 | crypto::Algorithm::OCB3_AES256
         ));
-        
+
         let app_client = &pipe.client.pkt_num_spaces[packet::Epoch::Application];
         assert!(matches!(
             app_client.crypto_open.as_ref().unwrap().alg(),
@@ -12887,7 +12882,6 @@ mod tests {
 
             let mut pipe = <Pipe>::with_config(&config).unwrap();
 
-            env_logger::builder().format_timestamp_nanos().init();
             assert_eq!(pipe.handshake(), Ok(()));
 
             for _ in 1..10 {
@@ -14382,12 +14376,12 @@ mod tests {
 
         let mut buf = [0; 128];
 
-        // Sender would send chunks of 5 bytes, with no copy accross the two
-        // buffers. So we expect 6 packets.
-        for _ in 0..6 {
-            let (len, _) = pipe.client.send(&mut buf).unwrap();
-            assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
-        }
+        // Since each 5-byte RangeBuf is smaller than the packet capacity and
+        // followed by another contiguous RangeBuf, `try_emit_zc` falls back to
+        // `emit()` and coalesces all 6 RangeBufs (23 bytes) into 1 packet.
+        let (len, _) = pipe.client.send(&mut buf).unwrap();
+        assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
 
         if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
             let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
@@ -14423,7 +14417,7 @@ mod tests {
         let mut pipe = Pipe::<BufTestFactory>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        // In testing, stream_send cuts every 5 chars.
+        // In testing, stream_send cuts every 5 chars ([5, 5, 2]).
         assert_eq!(pipe.client.stream_send(8, b"hello, world", false), Ok(12));
         assert_eq!(
             pipe.client.stream_send_zc(
@@ -14436,13 +14430,11 @@ mod tests {
         );
 
         let mut buf = [0; 256];
-        for _ in 0..3 {
-            let (len, _) = pipe.client.send(&mut buf).unwrap();
-            assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
-        }
-        // Getting the information from stream_send_zc
+        // Coalesces the 5-byte chunks from `stream_send` and the 11-byte chunk
+        // from `stream_send_zc` across RangeBuf boundaries into 1 packet.
         let (len, _) = pipe.client.send(&mut buf).unwrap();
         assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
 
         if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
             let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
@@ -14479,6 +14471,7 @@ mod tests {
         let mut pipe = Pipe::<BufTestFactory>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
+        env_logger::builder().format_timestamp_nanos().init();
         assert_eq!(
             pipe.client.stream_send_zc(
                 4,
@@ -14490,6 +14483,7 @@ mod tests {
         );
         assert_eq!(pipe.advance(), Ok(()));
 
+        let mut buf = [0; 256];
         assert_eq!(
             pipe.client.stream_send_zc(
                 8,
@@ -14499,24 +14493,34 @@ mod tests {
             ),
             Ok((12, None))
         );
+        let (len1, _) = pipe.client.send(&mut buf).unwrap();
+
         assert_eq!(
             pipe.client.stream_send_zc(
                 8,
                 BufTestFactory::buf_from_slice(b"ciao, world"),
                 Some(11),
-                true
+                false
             ),
             Ok((11, None))
         );
-
-        let mut buf = [0; 256];
-        // Sender would send 1 packet for each buffer since we enabled usage of
-        // the encryption's hidden copy for packet assembly.
-        let (len1, _) = pipe.client.send(&mut buf).unwrap();
         let (len2, _) = pipe.client.send(&mut buf[len1..]).unwrap();
+
+        // Also verify that a subsequent 0-byte FIN removes the stream from
+        // `flushable` after sending once.
+        assert_eq!(pipe.client.stream_send(8, b"", true), Ok(0));
+        let (len3, _) = pipe.client.send(&mut buf[len1 + len2..]).unwrap();
+        assert_eq!(
+            pipe.client.send(&mut buf[len1 + len2 + len3..]),
+            Err(Error::Done)
+        );
 
         assert_eq!(pipe.server_recv(&mut buf[..len1]), Ok(len1));
         assert_eq!(pipe.server_recv(&mut buf[len1..len1 + len2]), Ok(len2));
+        assert_eq!(
+            pipe.server_recv(&mut buf[len1 + len2..len1 + len2 + len3]),
+            Ok(len3)
+        );
         if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
             assert_eq!((len1, len2), (54, 53));
             let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
