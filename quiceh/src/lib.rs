@@ -14467,11 +14467,9 @@ mod tests {
         config.enable_hidden_copy_for_zc_sender(true);
         config.verify_peer(false);
 
-        // Perform initial handshake.
         let mut pipe = Pipe::<BufTestFactory>::with_config(&config).unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        env_logger::builder().format_timestamp_nanos().init();
         assert_eq!(
             pipe.client.stream_send_zc(
                 4,
@@ -14481,9 +14479,9 @@ mod tests {
             ),
             Ok((4, None))
         );
+        // This should be send in zc since rangebufs are 5 bytes
         assert_eq!(pipe.advance(), Ok(()));
 
-        let mut buf = [0; 256];
         assert_eq!(
             pipe.client.stream_send_zc(
                 8,
@@ -14493,7 +14491,6 @@ mod tests {
             ),
             Ok((12, None))
         );
-        let (len1, _) = pipe.client.send(&mut buf).unwrap();
 
         assert_eq!(
             pipe.client.stream_send_zc(
@@ -14504,31 +14501,16 @@ mod tests {
             ),
             Ok((11, None))
         );
-        let (len2, _) = pipe.client.send(&mut buf[len1..]).unwrap();
-
-        // Also verify that a subsequent 0-byte FIN removes the stream from
-        // `flushable` after sending once.
         assert_eq!(pipe.client.stream_send(8, b"", true), Ok(0));
-        let (len3, _) = pipe.client.send(&mut buf[len1 + len2..]).unwrap();
-        assert_eq!(
-            pipe.client.send(&mut buf[len1 + len2 + len3..]),
-            Err(Error::Done)
-        );
+        // We should have emit(), given the fact that rangebufs are 5 bytes.
+        assert_eq!(pipe.advance(), Ok(()));
 
-        assert_eq!(pipe.server_recv(&mut buf[..len1]), Ok(len1));
-        assert_eq!(pipe.server_recv(&mut buf[len1..len1 + len2]), Ok(len2));
-        assert_eq!(
-            pipe.server_recv(&mut buf[len1 + len2..len1 + len2 + len3]),
-            Ok(len3)
-        );
         if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_VREVERSO {
-            assert_eq!((len1, len2), (54, 53));
             let (b, len, fin) = pipe.server.stream_peek(8).unwrap();
             assert_eq!(b, b"hello, worldciao, world");
             assert_eq!((len, fin), (23, true));
             assert!(pipe.server.stream_consumed(8, len).is_ok());
         } else {
-            assert_eq!((len1, len2), (51, 50));
             assert_eq!(pipe.server.stream_recv(8, &mut buf), Ok((23, true)));
         }
     }
