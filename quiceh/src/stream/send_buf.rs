@@ -233,62 +233,6 @@ impl<F: BufFactory> SendBuf<F> {
         Ok((ret, remainder))
     }
 
-    pub fn rangebuf_len(&mut self, cap: usize) -> Result<(usize, bool)> {
-        let next_off = self.off_front();
-        let mut fin = self.fin_off == Some(next_off);
-        let mut buf_len = 0;
-
-        while let Some(buf) = self.data.get(self.pos) {
-            let off_front = self.off_front();
-            if self.is_empty() ||
-                off_front >= self.off ||
-                off_front != next_off ||
-                off_front >= self.max_data
-            {
-                break;
-            }
-
-            if buf.is_empty() {
-                self.pos += 1;
-                continue;
-            }
-
-            buf_len = cmp::min(buf.len(), cap);
-
-            fin = self.fin_off == Some(buf.off() + buf_len as u64);
-            break;
-        }
-
-        Ok((buf_len, fin))
-    }
-
-    pub fn rangebuf_get(&self) -> Option<&RangeBuf<F>> {
-        self.data.get(self.pos)
-    }
-
-    pub fn rangebuf_consume(&mut self, consumed: usize) {
-        let buf = match self.data.get_mut(self.pos) {
-            Some(v) => v,
-            None => return,
-        };
-
-        if buf.is_empty() {
-            return;
-        }
-
-        self.len -= consumed as u64;
-
-        let next_off = buf.off() + consumed as u64;
-
-        if consumed == buf.len() {
-            self.pos += 1;
-        }
-
-        buf.consume(consumed);
-
-        self.emit_off = cmp::max(self.emit_off, next_off);
-    }
-
     pub fn emit_rangebuf_vec(
         &mut self, max_len: usize,
     ) -> (Vec<RangeBuf<F>>, usize) {
@@ -301,10 +245,10 @@ impl<F: BufFactory> SendBuf<F> {
         while out_len > 0 {
             let off_front = self.off_front();
 
-            if self.is_empty() ||
-                off_front >= self.off ||
-                off_front != next_off ||
-                off_front >= self.max_data
+            if self.is_empty()
+                || off_front >= self.off
+                || off_front != next_off
+                || off_front >= self.max_data
             {
                 break;
             }
@@ -338,6 +282,66 @@ impl<F: BufFactory> SendBuf<F> {
         (cryptovec, max_len - out_len)
     }
 
+    pub fn try_emit_zc(
+        &mut self, cap: usize,
+    ) -> Result<Option<(usize, bool, usize, usize)>> {
+        let next_off = self.off_front();
+
+        while let Some(buf) = self.data.get(self.pos) {
+            if buf.is_empty() {
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        let off_front = next_off;
+        if self.is_empty()
+            || off_front >= self.off
+            || off_front != next_off
+            || off_front >= self.max_data
+        {
+            return Ok(None);
+        }
+
+        // SAFETY: self.max_data - off_front cannot underflow as max_data is always >= off_front
+        let avail_cap = cmp::min(cap, (self.max_data - off_front) as usize);
+        let pos = self.pos;
+        let front_len = self.data[pos].len();
+
+        // We need to Self::emit() instead if these conditions are verified
+        // That is, we are trying to encrypt at the boundaries of two rangebufs.
+        if front_len < avail_cap {
+            let front_max_off = self.data[pos].max_off();
+            if self.data.get(pos + 1).is_some_and(|next| {
+                !next.is_empty() && next.off() == front_max_off
+            }) {
+                return Ok(None);
+            }
+        }
+
+        let buf = &mut self.data[pos];
+        let buf_len = cmp::min(front_len, avail_cap);
+        let old_pos = buf.pos;
+        let new_off = buf.off() + buf_len as u64;
+        let fin = self.fin_off == Some(new_off);
+
+        // Consume what we emit
+        self.len -= buf_len as u64;
+        if buf_len == front_len {
+            self.pos += 1;
+        }
+        buf.consume(buf_len);
+        self.emit_off = cmp::max(self.emit_off, new_off);
+
+        Ok(Some((buf_len, fin, pos, old_pos)))
+    }
+
+    #[inline]
+    pub fn get_zc_slice(&self, pos: usize, old_pos: usize, len: usize) -> &[u8] {
+        &self.data[pos].data.as_ref()[old_pos..old_pos + len]
+    }
+
     /// Writes data from the send buffer into the given output buffer.
     pub fn emit(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
         let mut out_len = out.len();
@@ -348,10 +352,10 @@ impl<F: BufFactory> SendBuf<F> {
         while out_len > 0 {
             let off_front = self.off_front();
 
-            if self.is_empty() ||
-                off_front >= self.off ||
-                off_front != next_off ||
-                off_front >= self.max_data
+            if self.is_empty()
+                || off_front >= self.off
+                || off_front != next_off
+                || off_front >= self.max_data
             {
                 break;
             }
