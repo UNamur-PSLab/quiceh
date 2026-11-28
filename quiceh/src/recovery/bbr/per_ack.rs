@@ -114,13 +114,17 @@ fn bbr_update_rtprop(r: &mut Recovery, now: Instant) {
 // 4.2.2 Send Quantum
 fn bbr_set_send_quantum(r: &mut Recovery) {
     let rate = r.bbr_state.pacing_rate;
+    let max_quantum = r.max_send_quantum.max(r.max_datagram_size);
 
     r.send_quantum = match rate {
         rate if rate < PACING_RATE_1_2MBPS => r.max_datagram_size,
 
-        rate if rate < PACING_RATE_24MBPS => 2 * r.max_datagram_size,
+        rate if rate < PACING_RATE_24MBPS => {
+            (2 * r.max_datagram_size).min(max_quantum)
+        },
 
-        _ => cmp::min((rate / 1000_u64) as usize, 64 * 1024),
+        _ => ((rate / 1000_u64).min(max_quantum as u64) as usize)
+            .max((2 * r.max_datagram_size).min(max_quantum)),
     }
 }
 

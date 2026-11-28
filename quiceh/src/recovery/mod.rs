@@ -68,6 +68,15 @@ const LOSS_REDUCTION_FACTOR: f64 = 0.5;
 
 const PACING_MULTIPLIER: f64 = 1.25;
 
+// Pacing multiplier in slow start to keep up with 2x/RTT cwnd growth.
+const SLOW_START_PACING_MULTIPLIER: f64 = 2.0;
+
+// Default maximum send quantum (64 KiB, matching Linux UDP GSO limit).
+pub(crate) const DEFAULT_MAX_SEND_QUANTUM: usize = 64 * 1024;
+
+// 1.2 Mbps in bytes/sec (threshold for 1 MSS vs 2 MSS send_quantum floor).
+const PACING_RATE_1_2MBPS: u64 = 1200 * 1000 / 8;
+
 // How many non ACK eliciting packets we send before including a PING to solicit
 // an ACK.
 pub(super) const MAX_OUTSTANDING_NON_ACK_ELICITING: usize = 24;
@@ -385,6 +394,9 @@ pub struct Recovery {
     // transmitted together.
     send_quantum: usize,
 
+    // Upper bound on `send_quantum`, in bytes.
+    max_send_quantum: usize,
+
     // BBR state.
     bbr_state: bbr::State,
 
@@ -405,6 +417,7 @@ pub struct RecoveryConfig {
     hystart: bool,
     pacing: bool,
     max_pacing_rate: Option<u64>,
+    max_send_quantum: usize,
     initial_congestion_window_packets: usize,
 }
 
@@ -417,6 +430,7 @@ impl RecoveryConfig {
             hystart: config.hystart,
             pacing: config.pacing,
             max_pacing_rate: config.max_pacing_rate,
+            max_send_quantum: config.max_send_quantum,
             initial_congestion_window_packets: config
                 .initial_congestion_window_packets,
         }
@@ -427,6 +441,9 @@ impl Recovery {
     pub fn new_with_config(recovery_config: &RecoveryConfig) -> Self {
         let initial_congestion_window = recovery_config.max_send_udp_payload_size
             * recovery_config.initial_congestion_window_packets;
+        let initial_send_quantum = initial_congestion_window
+            .min(recovery_config.max_send_quantum)
+            .max(recovery_config.max_send_udp_payload_size);
 
         Recovery {
             epochs: Default::default(),
@@ -475,7 +492,7 @@ impl Recovery {
 
             pacer: pacer::Pacer::new(
                 recovery_config.pacing,
-                initial_congestion_window,
+                initial_send_quantum,
                 0,
                 recovery_config.max_send_udp_payload_size,
                 recovery_config.max_pacing_rate,
@@ -483,7 +500,9 @@ impl Recovery {
 
             prr: prr::PRR::default(),
 
-            send_quantum: initial_congestion_window,
+            send_quantum: initial_send_quantum,
+
+            max_send_quantum: recovery_config.max_send_quantum,
 
             #[cfg(feature = "qlog")]
             qlog_metrics: QlogMetrics::default(),
@@ -510,12 +529,18 @@ impl Recovery {
     pub fn reset(&mut self) {
         self.congestion_window =
             self.max_datagram_size * self.initial_congestion_window_packets;
+        self.send_quantum = self
+            .congestion_window
+            .min(self.max_send_quantum)
+            .max(self.max_datagram_size);
         self.epochs.iter_mut().for_each(|e| e.in_flight_count = 0);
         self.congestion_recovery_start_time = None;
         self.ssthresh = usize::MAX;
         (self.cc_ops.reset)(self);
         self.hystart.reset();
         self.prr = prr::PRR::default();
+        self.pacer
+            .update_max_datagram_size(self.max_datagram_size, self.send_quantum);
     }
 
     /// Returns whether or not we should elicit an ACK even if we wouldn't
@@ -591,14 +616,8 @@ impl Recovery {
 
         self.bytes_sent += sent_bytes;
 
-        // Pacing: Set the pacing rate if CC doesn't do its own.
-        if !(self.cc_ops.has_custom_pacing)()
-            && self.rtt_stats.first_rtt_sample.is_some()
-        {
-            let rate = PACING_MULTIPLIER * self.congestion_window as f64
-                / self.rtt_stats.smoothed_rtt.as_secs_f64();
-            self.set_pacing_rate(rate as u64, now);
-        }
+        // Pacing: Set the pacing rate and send quantum if CC doesn't do its own.
+        self.update_pacing_and_send_quantum(now);
 
         self.schedule_next_packet(now, sent_bytes);
 
@@ -633,6 +652,50 @@ impl Recovery {
         }
 
         self.bytes_in_flight += sent_bytes;
+    }
+
+    fn compute_pacing_rate(&self) -> u64 {
+        let multiplier = if self.congestion_window < self.ssthresh
+            && !self.hystart.in_css()
+        {
+            SLOW_START_PACING_MULTIPLIER
+        } else {
+            PACING_MULTIPLIER
+        };
+
+        let rate = multiplier * self.congestion_window as f64
+            / self.rtt_stats.smoothed_rtt.as_secs_f64();
+
+        rate as u64
+    }
+
+    fn update_send_quantum(&mut self, pacing_rate: u64) {
+        let effective_rate = match self.pacer.max_pacing_rate() {
+            Some(max_rate) => pacing_rate.min(max_rate),
+            None => pacing_rate,
+        };
+
+        let max_quantum = self.max_send_quantum.max(self.max_datagram_size);
+        let floor = if effective_rate < PACING_RATE_1_2MBPS {
+            self.max_datagram_size
+        } else {
+            (2 * self.max_datagram_size).min(max_quantum)
+        };
+
+        // Size quantum to ~1ms of pacing rate, clamped to [floor, max_quantum].
+        self.send_quantum = ((effective_rate / 1000).min(max_quantum as u64)
+            as usize)
+            .max(floor);
+    }
+
+    fn update_pacing_and_send_quantum(&mut self, now: Instant) {
+        if !(self.cc_ops.has_custom_pacing)()
+            && self.rtt_stats.first_rtt_sample.is_some()
+        {
+            let rate = self.compute_pacing_rate();
+            self.update_send_quantum(rate);
+            self.set_pacing_rate(rate, now);
+        }
     }
 
     pub fn set_pacing_rate(&mut self, rate: u64, now: Instant) {
@@ -699,6 +762,7 @@ impl Recovery {
         // Undo congestion window update.
         if has_in_flight_spurious_loss {
             (self.cc_ops.rollback)(self);
+            self.update_pacing_and_send_quantum(now);
         }
 
         if newly_acked.is_empty() {
@@ -709,7 +773,8 @@ impl Recovery {
         let largest_newly_acked = newly_acked.last().unwrap();
 
         if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
-            let latest_rtt = now - largest_newly_acked.time_sent;
+            let latest_rtt =
+                now.saturating_duration_since(largest_newly_acked.time_sent);
             self.rtt_stats.update_rtt(
                 latest_rtt,
                 Duration::from_micros(ack_delay),
@@ -884,6 +949,10 @@ impl Recovery {
     pub fn pmtud_update_max_datagram_size(
         &mut self, new_max_datagram_size: usize,
     ) {
+        if new_max_datagram_size == self.max_datagram_size {
+            return;
+        }
+
         // Congestion Window is updated only when it's not updated already.
         if self.congestion_window
             == self.max_datagram_size * self.initial_congestion_window_packets
@@ -892,19 +961,33 @@ impl Recovery {
                 new_max_datagram_size * self.initial_congestion_window_packets;
         }
 
-        self.pacer = pacer::Pacer::new(
-            self.pacer.enabled(),
-            self.congestion_window,
-            0,
-            new_max_datagram_size,
-            self.pacer.max_pacing_rate(),
-        );
         self.max_datagram_size = new_max_datagram_size;
+
+        if !(self.cc_ops.has_custom_pacing)() {
+            if self.rtt_stats.first_rtt_sample.is_some() {
+                let rate = self.compute_pacing_rate();
+                self.update_send_quantum(rate);
+            } else {
+                self.send_quantum = (new_max_datagram_size
+                    * self.initial_congestion_window_packets)
+                    .min(self.max_send_quantum)
+                    .max(new_max_datagram_size);
+            }
+        } else {
+            self.send_quantum = self.send_quantum.max(new_max_datagram_size);
+        }
+
+        self.pacer
+            .update_max_datagram_size(new_max_datagram_size, self.send_quantum);
     }
 
     pub fn update_max_datagram_size(&mut self, new_max_datagram_size: usize) {
         let max_datagram_size =
             cmp::min(self.max_datagram_size, new_max_datagram_size);
+
+        if max_datagram_size == self.max_datagram_size {
+            return;
+        }
 
         // Update cwnd if it hasn't been updated yet.
         if self.congestion_window
@@ -914,15 +997,24 @@ impl Recovery {
                 max_datagram_size * self.initial_congestion_window_packets;
         }
 
-        self.pacer = pacer::Pacer::new(
-            self.pacer.enabled(),
-            self.congestion_window,
-            0,
-            max_datagram_size,
-            self.pacer.max_pacing_rate(),
-        );
-
         self.max_datagram_size = max_datagram_size;
+
+        if !(self.cc_ops.has_custom_pacing)() {
+            if self.rtt_stats.first_rtt_sample.is_some() {
+                let rate = self.compute_pacing_rate();
+                self.update_send_quantum(rate);
+            } else {
+                self.send_quantum = (max_datagram_size
+                    * self.initial_congestion_window_packets)
+                    .min(self.max_send_quantum)
+                    .max(max_datagram_size);
+            }
+        } else {
+            self.send_quantum = self.send_quantum.max(max_datagram_size);
+        }
+
+        self.pacer
+            .update_max_datagram_size(max_datagram_size, self.send_quantum);
     }
 
     fn loss_time_and_space(&self) -> (Option<Instant>, packet::Epoch) {
@@ -1056,6 +1148,8 @@ impl Recovery {
 
         // Call congestion control hooks.
         (self.cc_ops.on_packets_acked)(self, acked, now);
+
+        self.update_pacing_and_send_quantum(now);
     }
 
     fn in_congestion_recovery(&self, sent_time: Instant) -> bool {
@@ -1085,6 +1179,8 @@ impl Recovery {
         }
 
         self.bytes_in_flight -= lost_bytes;
+
+        self.update_pacing_and_send_quantum(now);
     }
 
     fn congestion_event(
@@ -1101,6 +1197,13 @@ impl Recovery {
 
     fn collapse_cwnd(&mut self) {
         (self.cc_ops.collapse_cwnd)(self);
+
+        if !(self.cc_ops.has_custom_pacing)()
+            && self.rtt_stats.first_rtt_sample.is_some()
+        {
+            let rate = self.compute_pacing_rate();
+            self.update_send_quantum(rate);
+        }
     }
 
     pub fn update_app_limited(&mut self, v: bool) {
@@ -1248,6 +1351,7 @@ impl std::fmt::Debug for Recovery {
             self.congestion_recovery_start_time
         )?;
         write!(f, "{:?} ", self.delivery_rate)?;
+        write!(f, "send_quantum={} ", self.send_quantum)?;
         write!(f, "pacer={:?} ", self.pacer)?;
 
         if self.hystart.enabled() {
@@ -2286,16 +2390,150 @@ mod tests {
         assert_eq!(r.epochs[packet::Epoch::Application].sent_packets.len(), 3);
         assert_eq!(r.bytes_in_flight, 13000);
 
-        // We pace this outgoing packet. as all conditions for pacing
-        // are passed.
-        let pacing_rate =
-            (r.congestion_window as f64 * PACING_MULTIPLIER / 0.05) as u64;
+        // We pace this outgoing packet, as all conditions for pacing
+        // are passed. In slow start, SLOW_START_PACING_MULTIPLIER is used.
+        let pacing_rate = (r.congestion_window as f64
+            * SLOW_START_PACING_MULTIPLIER
+            / 0.05) as u64;
         assert_eq!(r.pacer.rate(), pacing_rate);
+        assert_eq!(r.send_quantum(), 2 * r.max_datagram_size());
 
+        // Each 6000-byte packet exceeded send_quantum (2400 B), scheduling
+        // two 6000-byte pacing intervals before packet 3.
         assert_eq!(
             r.get_packet_send_time(),
-            now + Duration::from_secs_f64(12000.0 / pacing_rate as f64)
+            now + Duration::from_secs_f64(6000.0 / pacing_rate as f64) * 2
         );
+    }
+
+    #[test]
+    fn cubic_send_quantum_dynamic() {
+        let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        cfg.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+
+        let mut r = Recovery::new(&cfg);
+        let now = Instant::now();
+        let mss = r.max_datagram_size();
+
+        // Before the first RTT sample, send_quantum defaults to initcwnd.
+        assert_eq!(r.send_quantum(), mss * r.initial_congestion_window_packets);
+
+        // Very low bandwidth (< 1.2 Mbps): floor is 1 * MSS.
+        r.rtt_stats.update_rtt(
+            Duration::from_millis(500),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r.update_pacing_and_send_quantum(now);
+        assert_eq!(r.send_quantum(), mss);
+
+        // Medium-low bandwidth (between 1.2 Mbps and ~20 Mbps): floor is 2 * MSS.
+        r.rtt_stats = RttStats::new(Duration::ZERO);
+        r.rtt_stats.update_rtt(
+            Duration::from_millis(50),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r.update_pacing_and_send_quantum(now);
+        assert_eq!(r.send_quantum(), 2 * mss);
+
+        // High bandwidth in Slow Start (e.g. 10 MiB cwnd, 10ms RTT -> 2 GB/s
+        // pacing rate): scales up to default 64 KiB ceiling.
+        r.congestion_window = 10 * 1024 * 1024;
+        r.rtt_stats = RttStats::new(Duration::ZERO);
+        r.rtt_stats.update_rtt(
+            Duration::from_millis(10),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r.update_pacing_and_send_quantum(now);
+        assert_eq!(r.send_quantum(), DEFAULT_MAX_SEND_QUANTUM);
+        assert_eq!(
+            r.pacer.rate(),
+            (r.congestion_window as f64 * SLOW_START_PACING_MULTIPLIER / 0.01)
+                as u64
+        );
+
+        // Intermediate bandwidth in Congestion Avoidance (~25 MB/s pacing rate):
+        // ~1ms of pacing rate (~25,000 B).
+        r.congestion_window = 200_000;
+        r.ssthresh = 200_000;
+        r.update_pacing_and_send_quantum(now);
+        let expected_rate =
+            (r.congestion_window as f64 * PACING_MULTIPLIER / 0.01) as u64;
+        assert_eq!(r.pacer.rate(), expected_rate);
+        assert_eq!(r.send_quantum(), (expected_rate / 1000) as usize);
+
+        // Collapsing cwnd drops send_quantum back down immediately.
+        r.collapse_cwnd();
+        assert_eq!(r.send_quantum(), 2 * mss);
+
+        // Custom max_send_quantum and max_pacing_rate are both respected.
+        let mut cfg_custom = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        cfg_custom.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+        cfg_custom.set_max_send_quantum(128 * 1024);
+        let mut r_custom = Recovery::new(&cfg_custom);
+        r_custom.congestion_window = 10 * 1024 * 1024;
+        r_custom.rtt_stats.update_rtt(
+            Duration::from_millis(10),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r_custom.update_pacing_and_send_quantum(now);
+        assert_eq!(r_custom.send_quantum(), 128 * 1024);
+
+        let mut cfg_capped = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        cfg_capped.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+        cfg_capped.set_max_pacing_rate(20_000_000); // 20 MB/s -> 20 KB/ms
+        let mut r_capped = Recovery::new(&cfg_capped);
+        r_capped.congestion_window = 10 * 1024 * 1024;
+        r_capped.rtt_stats.update_rtt(
+            Duration::from_millis(10),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r_capped.update_pacing_and_send_quantum(now);
+        assert_eq!(r_capped.send_quantum(), 20_000);
+    }
+
+    #[test]
+    fn send_quantum_pmtud_update() {
+        let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        cfg.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+
+        let mut r = Recovery::new(&cfg);
+        let now = Instant::now();
+
+        // Jumbo MTU update before first RTT sample scales initial send_quantum
+        // up to max_send_quantum instead of leaving it stale at 12,000 B.
+        r.pmtud_update_max_datagram_size(9000);
+        assert_eq!(r.max_datagram_size(), 9000);
+        assert_eq!(r.send_quantum(), DEFAULT_MAX_SEND_QUANTUM);
+
+        // After RTT sample, no-op PMTUD update must not wipe pacer rate.
+        r.rtt_stats.update_rtt(
+            Duration::from_millis(10),
+            Duration::ZERO,
+            now,
+            true,
+        );
+        r.update_pacing_and_send_quantum(now);
+        let rate_before = r.pacer.rate();
+        assert!(rate_before > 0);
+
+        r.pmtud_update_max_datagram_size(9000);
+        assert_eq!(r.pacer.rate(), rate_before);
+
+        // Shrinking MTU updates max_datagram_size and preserves valid quantum.
+        r.update_max_datagram_size(1350);
+        assert_eq!(r.max_datagram_size(), 1350);
+        assert!(r.send_quantum() >= 1350);
+        assert_eq!(r.pacer.rate(), rate_before);
     }
 
     #[test]

@@ -632,13 +632,14 @@ fn bbr2_set_send_quantum(r: &mut Recovery) {
     let bbr = &mut r.bbr2_state;
 
     let rate = bbr.pacing_rate;
+    let max_quantum = r.max_send_quantum.max(r.max_datagram_size);
     let floor = if rate < PACING_RATE_1_2MBPS {
         r.max_datagram_size
     } else {
-        2 * r.max_datagram_size
+        (2 * r.max_datagram_size).min(max_quantum)
     };
 
-    r.send_quantum = cmp::min((rate / 1000_u64) as usize, 64 * 1024); // Assumes send buffer is limited to 64KB
+    r.send_quantum = (rate / 1000_u64).min(max_quantum as u64) as usize;
     r.send_quantum = r.send_quantum.max(floor);
 }
 

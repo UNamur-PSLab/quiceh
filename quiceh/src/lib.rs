@@ -876,6 +876,7 @@ pub struct Config {
 
     pacing: bool,
     max_pacing_rate: Option<u64>,
+    max_send_quantum: usize,
 
     dgram_recv_max_queue_len: usize,
     dgram_send_max_queue_len: usize,
@@ -947,6 +948,7 @@ impl Config {
             hystart: true,
             pacing: true,
             max_pacing_rate: None,
+            max_send_quantum: recovery::DEFAULT_MAX_SEND_QUANTUM,
 
             dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
@@ -1404,6 +1406,16 @@ impl Config {
     /// By default pacing rate is not limited.
     pub fn set_max_pacing_rate(&mut self, v: u64) {
         self.max_pacing_rate = Some(v);
+    }
+
+    /// Sets the maximum size of the send quantum, in bytes.
+    ///
+    /// This caps the size of a data aggregate scheduled and transmitted
+    /// together by the congestion controller and pacer (e.g. for UDP GSO).
+    ///
+    /// The default value is 64 KiB (`65536`).
+    pub fn set_max_send_quantum(&mut self, v: usize) {
+        self.max_send_quantum = v;
     }
 
     /// Configures whether to enable receiving DATAGRAM frames.
@@ -5882,7 +5894,11 @@ impl<F: BufFactory> Connection<F> {
         path.sent_count += 1;
         path.sent_bytes += written as u64;
 
-        if self.dgram_send_queue.byte_size() > path.recovery.cwnd_available() {
+        if self.dgram_send_queue.byte_size() > path.recovery.cwnd_available()
+            || (self.tx_cap == 0
+                && self.streams.has_flushable()
+                && self.max_tx_data > self.tx_data)
+        {
             path.recovery.update_app_limited(false);
         }
 
@@ -17492,6 +17508,55 @@ mod tests {
 
         // We can't create a new packet header because there is no room by cwnd.
         // app_limited should be false because we can't send more by cwnd.
+        assert!(!pipe
+            .server
+            .paths
+            .get_active()
+            .expect("no active")
+            .recovery
+            .app_limited());
+    }
+
+    #[test]
+    fn app_limited_false_when_burst_capped() {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(50000);
+        config.set_initial_max_stream_data_bidi_local(50000);
+        config.set_initial_max_stream_data_bidi_remote(50000);
+        config.set_max_recv_udp_payload_size(1200);
+        config.verify_peer(false);
+
+        let mut pipe = <Pipe>::with_client_config(&config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client opens stream.
+        assert_eq!(pipe.client.stream_send(4, b"a", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server reads stream data.
+        let mut b = [0; 15];
+        if crate::PROTOCOL_VERSION == crate::PROTOCOL_VERSION_V1 {
+            pipe.server.stream_recv(4, &mut b).unwrap();
+        } else {
+            pipe.server.stream_peek(4).unwrap();
+        }
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server queues a full cwnd worth of stream data (tx_cap hits 0), but
+        // only flushes a single packet (simulating stopping at send_quantum
+        // before exhausting cwnd).
+        let send_buf = [0; 20000];
+        assert_eq!(pipe.server.stream_send(4, &send_buf, false), Ok(12000));
+        assert_eq!(pipe.server.tx_cap, 0);
+
+        let mut out = [0; 1200];
+        assert!(pipe.server.send(&mut out).is_ok());
+
+        // Even though bytes_in_flight < cwnd, stream data is queued up to cwnd
+        // and still flushable, so recovery must not mark the flow app_limited.
         assert!(!pipe
             .server
             .paths
