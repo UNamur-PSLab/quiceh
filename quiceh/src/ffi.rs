@@ -408,6 +408,13 @@ pub extern "C" fn quiceh_config_set_max_pacing_rate(config: &mut Config, v: u64)
 }
 
 #[no_mangle]
+pub extern "C" fn quiceh_config_set_max_send_quantum(
+    config: &mut Config, v: size_t,
+) {
+    config.set_max_send_quantum(v);
+}
+
+#[no_mangle]
 pub extern "C" fn quiceh_config_enable_dgram(
     config: &mut Config, enabled: bool, recv_queue_len: size_t,
     send_queue_len: size_t,

@@ -79,8 +79,9 @@ impl Pacer {
         enabled: bool, capacity: usize, rate: u64, max_datagram_size: usize,
         max_pacing_rate: Option<u64>,
     ) -> Self {
-        // Round capacity to MSS.
-        let capacity = capacity / max_datagram_size * max_datagram_size;
+        // Round capacity to MSS, ensuring at least 1 MSS.
+        let capacity = (capacity / max_datagram_size * max_datagram_size)
+            .max(max_datagram_size);
         let pacing_rate = if let Some(max_rate) = max_pacing_rate {
             max_rate.min(rate)
         } else {
@@ -126,12 +127,10 @@ impl Pacer {
     }
 
     /// Updates the bucket capacity or pacing_rate.
-    pub fn update(&mut self, capacity: usize, rate: u64, now: Instant) {
-        let capacity = capacity / self.max_datagram_size * self.max_datagram_size;
-
-        if self.capacity != capacity {
-            self.reset(now);
-        }
+    pub fn update(&mut self, capacity: usize, rate: u64, _now: Instant) {
+        let capacity = (capacity / self.max_datagram_size
+            * self.max_datagram_size)
+            .max(self.max_datagram_size);
 
         self.capacity = capacity;
 
@@ -140,6 +139,16 @@ impl Pacer {
         } else {
             rate
         };
+    }
+
+    /// Updates max_datagram_size and bucket capacity without resetting pacing
+    /// state.
+    pub fn update_max_datagram_size(
+        &mut self, max_datagram_size: usize, capacity: usize,
+    ) {
+        self.max_datagram_size = max_datagram_size;
+        self.capacity = (capacity / max_datagram_size * max_datagram_size)
+            .max(max_datagram_size);
     }
 
     /// Resets the pacer for the next burst.
@@ -323,5 +332,37 @@ mod tests {
             third_burst_send_time - second_burst_send_time,
             Duration::from_secs_f64(interval)
         );
+    }
+
+    #[test]
+    fn pacer_update_capacity_preserves_interval() {
+        let datagram_size = 1200;
+        let max_burst = datagram_size * 10;
+        let pacing_rate = 100_000;
+
+        let mut p = Pacer::new(true, max_burst, pacing_rate, datagram_size, None);
+        let now = Instant::now();
+
+        // Complete a full burst to arm `iv`.
+        p.send(max_burst, now);
+
+        // Changing capacity before the next burst must not wipe `iv`.
+        let new_burst = datagram_size * 20;
+        p.update(new_burst, pacing_rate, now);
+
+        let now = now + Duration::from_millis(5);
+        p.send(datagram_size, now);
+
+        let expected_interval = max_burst as f64 / pacing_rate as f64;
+        assert_eq!(
+            p.next_time() - now,
+            Duration::from_secs_f64(expected_interval)
+        );
+
+        // Updating max_datagram_size above capacity must keep capacity >= MSS
+        // and preserve pacing rate.
+        p.update_max_datagram_size(9000, 1200);
+        assert_eq!(p.rate(), pacing_rate);
+        assert_eq!(p.capacity, 9000);
     }
 }

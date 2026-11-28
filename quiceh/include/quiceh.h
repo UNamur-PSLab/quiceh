@@ -269,6 +269,9 @@ void quiceh_config_enable_pacing(quiceh_config *config, bool v);
 // Configures max pacing rate to be used.
 void quiceh_config_set_max_pacing_rate(quiceh_config *config, uint64_t v);
 
+// Configures the maximum send quantum size, in bytes.
+void quiceh_config_set_max_send_quantum(quiceh_config *config, size_t v);
+
 // Configures whether to enable receiving DATAGRAM frames.
 void quiceh_config_enable_dgram(quiceh_config *config, bool enabled,
                                 size_t recv_queue_len,
